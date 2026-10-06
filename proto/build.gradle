@@ -1,0 +1,23 @@
+plugins {
+    id 'java-library'
+    alias(libs.plugins.protobuf)
+}
+
+dependencies {
+    // `api` so consumers of this module get the protobuf runtime transitively: generated
+    // message classes expose protobuf-java types in their public API.
+    api libs.protobuf.java
+}
+
+protobuf {
+    protoc {
+        artifact = libs.protoc.get().toString()
+    }
+}
+
+spotless {
+    // Nothing hand-written in this module; everything under src/main/proto is generated from.
+    java {
+        target 'src/main/java/**/*.java'
+    }
+}

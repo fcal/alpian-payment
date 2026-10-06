@@ -1,0 +1,83 @@
+spring:
+  application:
+    name: payment-service
+
+  # Connection details come from the compose.yaml stack via spring-boot-docker-compose when
+  # running locally, and from the environment in any other setting. Defaults are supplied so
+  # the service can also be pointed at an already-running Postgres.
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/payment}
+    username: ${POSTGRES_USER:payment}
+    password: ${POSTGRES_PASSWORD:payment}
+    hikari:
+      # Payments serialize on a per-account row lock, and a waiting thread holds its
+      # connection for the duration of the wait. The pool must therefore be comfortably
+      # larger than the expected number of concurrent waiters on a single hot account,
+      # otherwise contention on one account can starve unrelated accounts.
+      maximum-pool-size: 20
+      # Fail fast rather than queueing indefinitely when the pool is exhausted.
+      connection-timeout: 3000
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # The application owns the schema here, which keeps local setup to a single command.
+    # A production deployment would run migrations as a separate step before rollout, so a
+    # failed migration cannot take the whole fleet down on restart.
+
+  jackson:
+    default-property-inclusion: non_null
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      # The outbox is the source of truth, so a lost publish is recoverable -- but acks=all
+      # plus idempotence keeps duplicate and reordered records out of the happy path.
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+
+payment:
+  # Bounds how long a payment will wait for the per-account row lock. Without this, a burst
+  # on one account pins connections until the pool is exhausted. On timeout the API answers
+  # 503 with Retry-After rather than hanging the client.
+  lock-timeout: 3s
+  outbox:
+    poll-interval: 500ms
+    batch-size: 100
+    max-attempts: 10
+    topic: payment-events
+
+server:
+  error:
+    # Errors are rendered as RFC 7807 ProblemDetail by a @RestControllerAdvice; the default
+    # Whitelabel error attributes would leak implementation detail.
+    whitelabel:
+      enabled: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    # Readiness must reflect Postgres: a service that cannot reach the database cannot take
+    # payments and should be pulled from the load balancer. Kafka is deliberately NOT a
+    # readiness dependency -- the outbox makes payments survive a Kafka outage, so the
+    # service stays available and the relay catches up afterwards.
+    db:
+      enabled: true
+
+logging:
+  pattern:
+    # paymentId is placed in the MDC for the duration of a request so a payment can be traced
+    # from the API through the outbox to the published event.
+    level: "%5p [${spring.application.name:},%X{paymentId:-}]"

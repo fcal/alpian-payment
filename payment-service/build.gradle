@@ -1,0 +1,57 @@
+plugins {
+    id 'java'
+    alias(libs.plugins.springBoot)
+    alias(libs.plugins.springDependencyManagement)
+}
+
+// Component tests live in their own source set: they drive the fully assembled service
+// against real Postgres and Kafka containers, so they are slower than unit tests and must
+// be runnable (and skippable) independently.
+sourceSets {
+    component {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+configurations {
+    componentImplementation.extendsFrom testImplementation
+    componentRuntimeOnly.extendsFrom testRuntimeOnly
+}
+
+dependencies {
+    implementation project(':proto')
+
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.kafka:spring-kafka'
+    implementation libs.springdoc.webmvc
+    implementation libs.flyway.core
+    runtimeOnly libs.flyway.postgresql
+    runtimeOnly libs.postgresql
+
+    // Starts the compose.yaml stack on `bootRun` and wires the datasource / Kafka bootstrap
+    // servers from it, so running the service locally needs no manual container management.
+    developmentOnly 'org.springframework.boot:spring-boot-docker-compose'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation platform(libs.testcontainers.bom)
+    testImplementation libs.testcontainers.junit
+    testImplementation libs.testcontainers.postgresql
+    testImplementation libs.testcontainers.kafka
+    testImplementation libs.awaitility
+}
+
+tasks.register('componentTest', Test) {
+    description = 'Runs component tests against real Postgres and Kafka containers.'
+    group = 'verification'
+    testClassesDirs = sourceSets.component.output.classesDirs
+    classpath = sourceSets.component.runtimeClasspath
+    shouldRunAfter tasks.named('test')
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('componentTest')
+}

@@ -1,0 +1,10 @@
+# Normalise line endings in the repository; check out with platform-native endings.
+* text=auto
+
+# The Gradle wrapper scripts must keep the endings their interpreter expects.
+gradlew      text eol=lf
+gradlew.bat  text eol=crlf
+*.sh         text eol=lf
+
+# Binary.
+*.jar binary

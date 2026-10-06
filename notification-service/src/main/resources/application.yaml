@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: notification-service
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    streams:
+      application-id: notification-service
+      properties:
+        # The deduplication state store and the output record must commit together: without
+        # this, a crash between emitting a notification and updating the store would allow a
+        # duplicate notification after restart.
+        processing.guarantee: exactly_once_v2
+        # A record that cannot be deserialized must not wedge the topology; it is logged and
+        # skipped rather than retried forever.
+        default.deserialization.exception.handler: org.apache.kafka.streams.errors.LogAndContinueExceptionHandler
+        num.stream.threads: 3
+
+notification:
+  input-topic: payment-events
+  output-topic: notification-events
+  dlt-topic: payment-events-dlt
+  # How long a payment id is remembered as already-notified. Must exceed the input topic's
+  # retention, otherwise a replayed record could be notified twice. Topic retention is 7
+  # days, so this is deliberately longer.
+  deduplication-retention: 8d
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+server:
+  port: 8081

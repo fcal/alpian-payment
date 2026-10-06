@@ -1,0 +1,54 @@
+plugins {
+    // No `java` plugin at the root: it holds build configuration only and produces no
+    // artifact of its own.
+    alias(libs.plugins.spotless) apply false
+}
+
+allprojects {
+    group = 'com.alpian'
+    version = '0.1.0-SNAPSHOT'
+}
+
+subprojects {
+    apply plugin: 'java'
+    apply plugin: libs.plugins.spotless.get().pluginId
+
+    repositories {
+        mavenCentral()
+    }
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(21)
+        }
+    }
+
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        testLogging {
+            events 'passed', 'skipped', 'failed'
+        }
+    }
+
+    // Both Boot modules share the one stack definition at the repository root.
+    // spring-boot-docker-compose resolves the compose file relative to the working
+    // directory, which for `bootRun` is the module directory -- so without this,
+    // `./gradlew :payment-service:bootRun` fails to find it.
+    plugins.withId('org.springframework.boot') {
+        tasks.named('bootRun') {
+            systemProperty 'spring.docker.compose.file',
+                    rootProject.file('compose.yaml').absolutePath
+        }
+    }
+
+    spotless {
+        java {
+            // Generated protobuf sources are excluded; we do not own their formatting.
+            targetExclude '**/build/generated/**'
+            googleJavaFormat(libs.versions.googleJavaFormat.get())
+            removeUnusedImports()
+            trimTrailingWhitespace()
+            endWithNewline()
+        }
+    }
+}

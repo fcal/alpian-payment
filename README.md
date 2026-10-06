@@ -1,0 +1,158 @@
+# Payment Service
+
+A payment service exposing a REST API to check an account balance and submit outbound
+payments, with the transaction journal in PostgreSQL and asynchronous sender notification
+over Kafka.
+
+Built for an assignment whose stated focus is **high availability, transactional processing
+and error handling**. The design rationale — including the trade-offs rejected along the way —
+is in [`docs/DESIGN_REVIEW.md`](docs/DESIGN_REVIEW.md).
+
+## Status
+
+Implemented in stages; each stage is independently buildable and green.
+
+| Stage | Scope | State |
+|---|---|---|
+| 0 | Build skeleton, local stack, schema migrations | ✅ Done |
+| 1 | Domain model, repository contract, in-memory implementation | ⏳ Next |
+| 2 | PostgreSQL implementation, row locking, concurrency tests | — |
+| 3 | REST API, error contract, OpenAPI | — |
+| 4 | Outbox relay → Kafka | — |
+| 5 | Notification service (Kafka Streams deduplication) | — |
+| 6 | End-to-end component tests | — |
+| 7 | Documentation and CI | — |
+
+## Modules
+
+| Module | Responsibility |
+|---|---|
+| `proto` | Protobuf definitions of the Kafka event contract, shared by both services |
+| `payment-service` | REST API, payment execution, transaction journal, outbox relay |
+| `notification-service` | Kafka Streams application: deduplicates payment events, notifies the sender |
+
+## Running locally
+
+Requires Docker and a JDK 21 toolchain (Gradle provisions the toolchain if absent).
+
+```bash
+./gradlew :payment-service:bootRun
+```
+
+`spring-boot-docker-compose` starts the [`compose.yaml`](compose.yaml) stack — PostgreSQL and
+Kafka in KRaft mode — and wires the datasource and broker address into the application, so no
+connection details are duplicated in configuration. Flyway applies the schema on startup and
+seeds demo data.
+
+To run the stack by hand instead:
+
+```bash
+docker compose up -d
+SPRING_DOCKER_COMPOSE_ENABLED=false ./gradlew :payment-service:bootRun
+```
+
+### Verifying the stack
+
+```bash
+curl -s localhost:8080/actuator/health | jq
+
+docker compose exec postgres psql -U payment -d payment -c '\dt'
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+```
+
+## Building and testing
+
+```bash
+./gradlew build          # compile, unit tests, component tests, format check
+./gradlew test           # unit tests only (no containers required)
+./gradlew componentTest  # component tests (requires Docker)
+./gradlew spotlessApply  # apply google-java-format
+```
+
+Component tests live in a dedicated `src/component` source set in `payment-service`: they
+drive the assembled service against real PostgreSQL and Kafka containers via Testcontainers,
+so they are slower than unit tests and are kept separately runnable.
+
+## Design summary
+
+The decisions below are argued in full, with their rejected alternatives, in
+[`docs/DESIGN_REVIEW.md`](docs/DESIGN_REVIEW.md).
+
+**Double spending is prevented in two independent places.** A client-supplied
+`Idempotency-Key` header, backed by a unique index on `(account_id, idempotency_key)`, makes a
+retried request replay its original outcome rather than debit twice — a server-generated id
+cannot do this, because a retry would simply mint a new one. Separately, a
+`CHECK (balance >= 0)` constraint on `account` means no code path can overdraft, regardless of
+application-level bugs.
+
+**Concurrent payments on one account are serialized by the database**, not by application
+state. The transaction takes `SELECT ... FOR UPDATE` on the account row, so correctness holds
+across multiple service replicas; an in-process lock would not. Payments on *different*
+accounts proceed fully in parallel. The guarantee is serialization — no lost updates, no
+overdraft — rather than arrival ordering, which is not observable over HTTP anyway.
+
+**The event and the state change are atomic, via a transactional outbox.** The outbox row is
+inserted in the same transaction as the debit, so there is no window in which Kafka holds an
+event that PostgreSQL rolled back, nor a committed payment whose event was lost. A relay
+publishes afterwards and claims rows with `FOR UPDATE SKIP LOCKED`, so replicas take disjoint
+batches without coordinating. A consequence worth stating plainly: **payments keep succeeding
+while Kafka is down**, and the relay catches up on recovery.
+
+**Delivery is at-least-once, so the consumer deduplicates.** The notification service is a
+Kafka Streams application keeping already-notified payment ids in a state store, with
+`exactly_once_v2` making the store update and the output record commit together. Note the
+precise claim: this makes notification *effectively* once; the final side effect of delivering
+a message to a person is at-least-once in any system.
+
+**Events are keyed by account id, not payment id.** That keeps an account's events on one
+partition and therefore ordered, and co-partitions them with the deduplication store. Topics
+use `cleanup.policy=delete` with bounded retention: these are immutable facts, not state, and
+compaction keyed on something unique per record would retain everything forever.
+
+**Persistence uses `JdbcClient` with hand-written SQL** rather than an ORM. The task centres on
+locking primitives — `FOR UPDATE`, conditional atomic updates, `SKIP LOCKED` — which read
+clearly as SQL and are obscured by JPA, whose natural read-mutate-flush idiom is the exact race
+being avoided. With four tables and no graph traversal, an ORM buys little.
+
+## Data model
+
+```
+app_user ──1:N──> account ──1:N──> payment
+```
+
+One user holds many accounts; an account belongs to exactly one user; a payment debits exactly
+one account. `payment` is an append-only journal — rows are never updated or deleted.
+
+Payments are **outbound only**: funds leave a held account toward an external beneficiary, so
+the single-sided `payment` row is correct rather than a simplification. Internal
+account-to-account transfer is explicitly out of scope; `docs/DESIGN_REVIEW.md` explains why it
+is a different feature rather than an increment (two-sided journalling, deterministic lock
+ordering to avoid deadlock, and cross-currency FX).
+
+Money is `NUMERIC(19,4)` in PostgreSQL and `BigDecimal` in Java, never a floating point type.
+Timestamps are `TIMESTAMPTZ`.
+
+Migrations are plain SQL under
+[`payment-service/src/main/resources/db/migration`](payment-service/src/main/resources/db/migration)
+and build the schema from scratch.
+
+## Scope exclusions
+
+These are deliberate, to keep the exercise focused:
+
+- **No authentication or authorization anywhere.** `userId` appears in the request path; in
+  production it must come from a validated JWT subject, and the code says so at the relevant
+  point. The service does still verify that the addressed account belongs to the addressed
+  user — without that check the path would be a trivial IDOR, and it is business logic rather
+  than authentication.
+- **No Kafka security.** PLAINTEXT listeners, no SASL, no TLS, no ACLs.
+- **No transport security**, no rate limiting, no quota enforcement.
+- **No Schema Registry.** Protobuf serdes are hand-rolled; a Schema Registry would own
+  compatibility enforcement in production.
+- **No account onboarding API.** Users and accounts are seeded by migration.
+- **No FX.** A payment's currency must equal its account's currency.
+- **Single-broker, single-replica Kafka** and a single PostgreSQL instance locally. Real high
+  availability needs RF ≥ 3 with `min.insync.replicas=2` and a replicated database; the
+  application-side design (stateless service, DB-enforced invariants, `SKIP LOCKED` relay) is
+  what makes running multiple replicas correct.

@@ -1,0 +1,5 @@
+rootProject.name = 'alpian-payment'
+
+include 'proto'
+include 'payment-service'
+include 'notification-service'

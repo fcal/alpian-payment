@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package alpian.payment.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option java_package = "com.alpian.payment.events.v1";
+option java_multiple_files = true;
+
+// Monetary amount.
+//
+// Protobuf has no decimal type, and `double` must never be used for money: binary floating
+// point cannot represent decimal fractions such as 0.10 exactly, and the error accumulates
+// across arithmetic. The amount is therefore carried as its decimal string representation,
+// which round-trips exactly through java.math.BigDecimal and matches the NUMERIC(19,4)
+// column it originates from.
+message Money {
+  // Decimal string, e.g. "1234.5600". Never grouped, always '.' as the decimal separator.
+  string amount = 1;
+  // ISO 4217 alphabetic code, e.g. "CHF".
+  string currency = 2;
+}
+
+// Outcome of an attempted payment.
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_STATUS_COMPLETED = 1;
+  PAYMENT_STATUS_FAILED = 2;
+}
+
+// A terminal payment lifecycle event, published once per payment attempt.
+//
+// Produced by the payment service's outbox relay and keyed on `account_id` so that an
+// account's events share a partition and therefore stay ordered. `payment_id` is the
+// deduplication key for consumers: the outbox gives at-least-once delivery, so a consumer
+// may legitimately see the same event more than once.
+message PaymentEvent {
+  // Deduplication key. Same value as the `payment` table's primary key.
+  string payment_id = 1;
+  string account_id = 2;
+  string user_id = 3;
+
+  Money amount = 4;
+  PaymentStatus status = 5;
+
+  // Present only when status is PAYMENT_STATUS_FAILED.
+  string failure_reason = 6;
+
+  string beneficiary_name = 7;
+  // Reference supplied by the payer, if any.
+  string reference = 8;
+
+  // When the payment was recorded in the journal -- not when the event was published, which
+  // may be later if the relay was catching up after an outage.
+  google.protobuf.Timestamp occurred_at = 9;
+}
+
+// A notification to be delivered to the payer, emitted after deduplication.
+message NotificationEvent {
+  string payment_id = 1;
+  string user_id = 2;
+  string account_id = 3;
+
+  Money amount = 4;
+  PaymentStatus status = 5;
+
+  // Human-readable message body.
+  string message = 6;
+
+  google.protobuf.Timestamp notified_at = 7;
+}
