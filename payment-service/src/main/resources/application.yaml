@@ -62,7 +62,32 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        # /actuator/prometheus serves the registry in Prometheus text format. Nothing scrapes
+        # it in this setup; it is exposed so the metrics can be inspected directly.
+        include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      # Applied to every meter, so one Prometheus can serve both services.
+      application: ${spring.application.name}
+    distribution:
+      # Explicit bucket boundaries rather than `percentiles-histogram: true`. The automatic
+      # option emits roughly seventy buckets per timer spanning up to 30s, which for an
+      # operation expected to complete in single-digit milliseconds is both a large number of
+      # wasted time series and resolution concentrated in the wrong range. These boundaries
+      # cover the range that actually occurs, ending at the 3s lock timeout beyond which a
+      # request is rejected anyway.
+      #
+      # Buckets are cumulative and mergeable across replicas, so Prometheus can compute a
+      # fleet-wide quantile with histogram_quantile() -- which client-side percentiles cannot
+      # do, since percentiles from separate instances are not averageable.
+      slo:
+        payment.execution: 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 3s
+        payment.lock.wait: 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 3s
+      # Client-side percentiles as well, for single-instance inspection without a Prometheus
+      # server to run queries against.
+      percentiles:
+        payment.execution: 0.5, 0.95, 0.99
+        payment.lock.wait: 0.5, 0.95, 0.99
   endpoint:
     health:
       show-details: always

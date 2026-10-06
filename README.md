@@ -167,6 +167,62 @@ replica counts and pod topology, synchronous PostgreSQL replication for RPO 0, K
 failure-by-failure walkthrough of observed behaviour and recovery, and a frank account of what
 HA does *not* give you.
 
+## Observability
+
+Metrics are exposed in Prometheus format at **`/actuator/prometheus`** (and as JSON at
+`/actuator/metrics`). Nothing scrapes them here — they are exposed so they can be read
+directly:
+
+```bash
+curl -s localhost:8080/actuator/prometheus | grep '^payment_'
+```
+
+Alongside the Spring Boot defaults (HTTP server timings, HikariCP pool state, JVM, Kafka
+client), the application registers:
+
+| Metric | Type | Purpose |
+|---|---|---|
+| `payment_attempts_total{outcome}` | counter | Attempts by terminal outcome |
+| `payment_amount{currency}` | summary | Value of completed payments |
+| `payment_execution_seconds` | timer | Transactional debit, lock acquisition to commit |
+| `payment_lock_wait_seconds` | timer | Time waiting for the per-account row lock |
+| `payment_outbox_pending` | gauge | Rows awaiting publication |
+| `payment_outbox_oldest_pending_age_seconds` | gauge | Age of the oldest unpublished row |
+| `payment_outbox_published_total` | counter | Rows published successfully |
+| `payment_outbox_publish_failures_total` | counter | Failed publication attempts |
+| `payment_outbox_parked_total` | counter | Rows parked after exhausting retries |
+
+Three choices are worth calling out, since they are the ones that make the metrics usable
+rather than merely present:
+
+- **Outbox age is the primary SLI.** A stalled relay is invisible from the API — payments keep
+  returning `201` while notifications silently stop. Age beats depth, because a deep but
+  draining backlog is healthy and a shallow static one is not.
+- **Every outcome counter is registered at zero on startup.** A counter that has never been
+  incremented is absent from a Prometheus scrape entirely, so an alert filtering on a rare
+  outcome would have no series to evaluate until the first occurrence — exactly when it needs
+  to already work. A unit test enforces this.
+- **Lock wait is timed separately from execution.** Both rising means a slow database; only the
+  wait rising means contention on a hot account. That distinction is the whole diagnostic value.
+
+Metric definitions live in one class
+([`PaymentMetrics`](payment-service/src/main/java/com/alpian/payment/observability/PaymentMetrics.java))
+rather than being scattered, because metric names are a published interface: dashboards and
+alert rules reference them, so a rename breaks whoever is on call.
+
+**Production improvement — shipping metrics onward.** The obvious next step is scraping this
+endpoint into a hosted backend such as Datadog. The preferred route is the **Datadog Agent's
+OpenMetrics check** (annotate the pod, the agent scrapes the existing endpoint) or an
+**OpenTelemetry Collector** fanning out to one or more backends. Both keep the service
+vendor-neutral, with no extra dependency and no API key in its configuration, so changing
+vendor touches deployment config rather than application code — which is why they are preferred
+over pushing directly with `micrometer-registry-datadog`. Distributed tracing
+(`micrometer-tracing-bridge-otel`, with trace context propagated through Kafka headers) is the
+other addition that would most improve debuggability across the two services.
+
+[`docs/DESIGN_REVIEW.md` §17](docs/DESIGN_REVIEW.md) covers the full catalogue, the
+instrumentation rationale, and suggested alert conditions.
+
 ## Scope exclusions
 
 These are deliberate, to keep the exercise focused:
@@ -178,6 +234,8 @@ These are deliberate, to keep the exercise focused:
   than authentication.
 - **No Kafka security.** PLAINTEXT listeners, no SASL, no TLS, no ACLs.
 - **No transport security**, no rate limiting, no quota enforcement.
+- **No metric scraping, dashboards, alert rules or distributed tracing.** Metrics are exposed
+  at `/actuator/prometheus` but nothing collects them; see the Observability section.
 - **No Schema Registry.** Protobuf serdes are hand-rolled; a Schema Registry would own
   compatibility enforcement in production.
 - **No account onboarding API.** Users and accounts are seeded by migration.

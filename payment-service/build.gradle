@@ -26,6 +26,8 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-jdbc'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    // Exposes the Actuator metrics in Prometheus text format at /actuator/prometheus.
+    runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
     implementation 'org.springframework.kafka:spring-kafka'
     implementation libs.springdoc.webmvc
     implementation libs.flyway.core

@@ -772,3 +772,150 @@ Worth stating plainly, because "HA" is often read as "nothing can go wrong":
   which is a large part of why the journal is append-only.
 - **HA is not capacity.** Three replicas sized for peak load have no headroom when one is lost.
   Replica count must account for the failure case, not just the steady state.
+
+---
+
+## 17. Observability
+
+§16.6 identified outbox depth as the primary service level indicator, which is only useful if
+something actually measures it. This section covers what is instrumented and why those
+particular things.
+
+### 17.1 What is exposed
+
+Micrometer is wired to a Prometheus registry, served by Actuator:
+
+| Endpoint | Purpose |
+|---|---|
+| `/actuator/prometheus` | All meters in Prometheus text exposition format |
+| `/actuator/metrics` | The same meters as JSON, convenient for ad-hoc inspection |
+| `/actuator/health` | Component health, with `liveness` and `readiness` groups |
+
+Nothing scrapes the endpoint in this setup — it is exposed so the metrics can be read directly.
+Every meter carries an `application` tag so a single Prometheus could serve both services.
+
+Alongside the application metrics, the Spring Boot defaults provide HTTP server timings
+(`http_server_requests_seconds`, tagged by URI, method and status), HikariCP pool state,
+JVM memory and GC, and Kafka client metrics.
+
+### 17.2 Metric catalogue
+
+| Metric | Type | Tags | Purpose |
+|---|---|---|---|
+| `payment_attempts_total` | counter | `outcome` | Attempts by terminal outcome |
+| `payment_amount` | summary | `currency` | Value of completed payments |
+| `payment_execution_seconds` | timer | — | Transactional debit, lock acquisition to commit |
+| `payment_lock_wait_seconds` | timer | — | Time waiting for the per-account row lock |
+| `payment_outbox_pending` | gauge | — | Rows awaiting publication |
+| `payment_outbox_oldest_pending_age_seconds` | gauge | — | Age of the oldest unpublished row |
+| `payment_outbox_published_total` | counter | — | Rows published successfully |
+| `payment_outbox_publish_failures_total` | counter | — | Failed publication attempts |
+| `payment_outbox_parked_total` | counter | — | Rows parked after exhausting retries |
+
+The `outcome` tag takes its values from the `PaymentOutcome` enum: `completed`,
+`insufficient_funds`, `currency_mismatch`, `account_not_found`, `account_not_owned`,
+`idempotent_replay`, `lock_timeout`, `validation_failed`.
+
+Notification-service counters (`notification_events_total{outcome}`, with
+`duplicate_suppressed` as a value, and `notification_dlt_total`) arrive with the topology in
+Stage 5. The `duplicate_suppressed` counter is worth singling out: it is the direct, observable
+evidence that the deduplication requirement is working, rather than something inferred from the
+absence of complaints.
+
+### 17.3 Instrumentation decisions
+
+**Metric definitions are centralised in one class.** `PaymentMetrics` holds every meter rather
+than scattering `registry.counter(...)` calls through the code. Metric names are a published
+interface — dashboards, alert rules and SLOs reference them, so renaming one is a breaking
+change for whoever is on call at the time. One class keeps that interface reviewable in a diff.
+
+**Every outcome counter is registered at zero on startup.** This is not cosmetic. A counter that
+has never been incremented is *absent entirely* from a Prometheus scrape, so an alert rule like
+
+```promql
+rate(payment_attempts_total{outcome="insufficient_funds"}[5m]) > 10
+```
+
+would evaluate against a non-existent series until the first such payment — precisely the
+moment the rule needs to already be working. Pre-registering every enum value means every
+series exists from startup. A unit test enforces this, because it is exactly the kind of
+property that a later refactor silently removes.
+
+**Lock wait is timed separately from execution.** Both are needed to tell two very different
+incidents apart: both rising means the database itself is slow, whereas only the wait rising
+means contention on a hot account. Conflating them into one timer hides that distinction at the
+point in an incident where it is the only question worth answering.
+
+**Backlog gauges are fed by the relay, not queried per scrape.** A naive gauge would run
+`SELECT count(*)` on every scrape, adding database load proportional to the number of scrapers
+and the size of the table. Instead the relay — which is already querying the outbox every 500ms
+— refreshes two `AtomicLong` holders, and the gauges read those. The scrape costs nothing.
+
+**Amounts are tagged by currency, never aggregated across them.** A single
+`payment_amount_sum` spanning CHF and EUR is a number with no meaning. Cardinality is safe
+because the tag is bounded by ISO 4217, and in practice by the currencies the accounts hold.
+
+**Histogram buckets are declared explicitly** rather than using
+`percentiles-histogram: true`. The automatic option emits roughly seventy buckets per timer
+spanning up to 30 seconds; for an operation expected to finish in single-digit milliseconds
+that is both a large number of wasted series and resolution concentrated in a range that never
+occurs. The declared boundaries (1ms to 3s, ending at the lock timeout beyond which a request
+is rejected anyway) cut the payment metric series from roughly 160 to 41.
+
+Buckets are published *in addition to* client-side percentiles, because the two answer
+different questions. Client-side percentiles are correct for one instance but **cannot be
+averaged across replicas** — the mean of three instances' p99 values is not the fleet p99.
+Cumulative buckets are mergeable, so `histogram_quantile()` computes a true fleet-wide quantile
+server-side. With multiple replicas, only the bucket form gives a meaningful answer.
+
+### 17.4 What to alert on
+
+Roughly in order of value:
+
+| Signal | Condition | Why it matters |
+|---|---|---|
+| `payment_outbox_oldest_pending_age_seconds` | > 60s sustained | **The highest-value alert.** A stalled relay is invisible from the API: payments return `201` and notifications silently stop. Age beats depth — a deep but draining backlog is healthy, a shallow static one is not |
+| `payment_outbox_parked_total` | any increase | A poison event needing human inspection |
+| `payment_attempts_total{outcome="lock_timeout"}` | rising rate | Contention on a hot account; capacity problem forming |
+| `payment_lock_wait_seconds` p99 | rising while execution flat | Contention, as distinct from database slowness |
+| `payment_attempts_total{outcome="account_not_owned"}` | any sustained rate | Legitimate clients do not address other users' accounts; this is a client bug or probing |
+| `hikaricp_connections_pending` | > 0 sustained | Pool exhaustion, often downstream of lock contention (§16.2) |
+| Consumer group lag on `payment-events` | growing | Notification service falling behind |
+
+### 17.5 Logs and traces
+
+The payment UUID is placed in the MDC and rendered in the log pattern, so one payment can be
+followed from the API through the outbox to the published event. In production this would be
+JSON-encoded rather than the human-readable pattern used locally, so a log backend can index
+the fields.
+
+**Distributed tracing is not implemented.** Two services and a Kafka hop is where traces start
+to earn their cost, and the extension is small: `micrometer-tracing-bridge-otel` plus an OTLP
+exporter, with trace context propagated through Kafka headers so a payment's REST request,
+outbox publication and notification appear as one trace. Worth noting that this is the piece
+that would most improve debuggability, because the current correlation id requires knowing
+which service to look in.
+
+### 17.6 Production: shipping metrics onward
+
+Exposing `/actuator/prometheus` is deliberately where this stops. Production would scrape it,
+and for Datadog specifically there are three routes:
+
+1. **Datadog Agent with the OpenMetrics check** (recommended) — annotate the pod, the agent
+   scrapes the existing endpoint. The application stays vendor-neutral, with no new dependency
+   and no credentials in the service.
+2. **OpenTelemetry Collector** — scrape with the Prometheus receiver, fan out to Datadog and
+   anywhere else. Best when metrics must reach more than one backend, or to keep the exit
+   vendor-agnostic.
+3. **`micrometer-registry-datadog`** — push directly from the application. Fewest moving parts,
+   but it couples the service to a vendor, puts an API key in its configuration, and makes the
+   app responsible for delivery and buffering.
+
+Option 1 or 2, because a metric endpoint is a far better integration seam than a push client:
+changing observability vendors then touches deployment configuration rather than application
+code. The same applies to the `management.metrics.tags` entry already in place — `application`
+becomes a Datadog tag with no further work.
+
+Also deliberately out of scope: dashboards, alert rules as code, SLO definitions, and trace
+sampling policy. The metric *contract* in §17.2 is the part that must be right first, since
+everything downstream references it by name.
