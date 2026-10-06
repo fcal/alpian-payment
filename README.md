@@ -137,6 +137,36 @@ Migrations are plain SQL under
 [`payment-service/src/main/resources/db/migration`](payment-service/src/main/resources/db/migration)
 and build the schema from scratch.
 
+## High availability
+
+This repository runs a development topology: one service instance, one PostgreSQL container,
+one Kafka broker. The application-side design is what makes a highly available deployment
+possible, and three properties were chosen with that in mind:
+
+- **The service is stateless.** All coordination lives in PostgreSQL, so replicas need no
+  affinity and no coordination. Handling concurrency with an in-process lock instead would have
+  been correct at one replica and silently wrong at two.
+- **Invariants are enforced by the database.** They hold regardless of replica count, execution
+  order, or a rolling deploy running two code versions at once.
+- **No transaction spans accounts**, so the account id is a natural shard key and the write path
+  is already shardable with no distributed transaction.
+
+Idempotency also makes failover recoverable: when a primary dies mid-transaction the client
+cannot know whether the payment committed, and retrying with the same `Idempotency-Key` is safe
+either way.
+
+The most valuable fault-tolerance property is that **a total Kafka outage does not stop
+payments**. The outbox makes publication asynchronous and recoverable, so the system degrades
+(notifications arrive late) rather than failing (payments rejected). This is why Kafka is
+deliberately excluded from the readiness probe — and it means outbox depth, not API health, is
+the signal that detects a stalled relay.
+
+[`docs/DESIGN_REVIEW.md` §16](docs/DESIGN_REVIEW.md) covers what production would require —
+replica counts and pod topology, synchronous PostgreSQL replication for RPO 0, Kafka RF 3 with
+`min.insync.replicas=2`, partition over-provisioning, Streams standby replicas — along with a
+failure-by-failure walkthrough of observed behaviour and recovery, and a frank account of what
+HA does *not* give you.
+
 ## Scope exclusions
 
 These are deliberate, to keep the exercise focused:

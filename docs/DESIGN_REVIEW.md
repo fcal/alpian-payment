@@ -514,3 +514,261 @@ Chosen for correctness and clarity, but the trade-offs are real and belong in th
 6. **Optimistic locking would invert these trade-offs:** no lock held and no connection pinned,
    at the cost of retry logic and wasted work under contention. Appropriate if a single account
    ever became a genuine throughput bottleneck.
+
+---
+
+## 16. High availability in a production deployment
+
+The exercise runs a single service instance against a single Postgres and a single Kafka
+broker. That is a *development* topology, not a highly available one. This section sets out
+what production would require, and — more usefully — how the system would actually behave
+when each component fails.
+
+### 16.1 What the current design already gets right
+
+Three properties are prerequisites for HA, and were chosen deliberately rather than
+discovered later:
+
+1. **The service is stateless.** No in-JVM locks, no session affinity, no in-memory
+   deduplication. Every piece of coordination lives in Postgres. This is the single most
+   important HA decision in the codebase: had concurrency been handled with a
+   `ConcurrentHashMap<accountId, Lock>` — the obvious first instinct — the service would be
+   *correct only at one replica*, and scaling out would silently reintroduce double spending.
+2. **Invariants are enforced by the database, not the application.** `CHECK (balance >= 0)`
+   and `UNIQUE (account_id, idempotency_key)` hold no matter how many replicas run, in what
+   order they execute, or which of them is mid-deploy with older code.
+3. **Every payment touches exactly one account.** There are no cross-account transactions, so
+   the account id is a natural shard key and the write path is *already* horizontally
+   shardable with no distributed transaction. This falls out of excluding internal transfers —
+   those would need two-phase commit across shards. Worth noting that the scope decision in
+   §15 bought a scalability property, not just a simpler schema.
+
+Idempotency also turns out to matter far beyond client retries: **it is what makes failover
+recoverable.** When a primary dies mid-transaction the client sees an error and cannot know
+whether the payment committed. Retrying with the same `Idempotency-Key` is safe, and resolves
+to the original outcome either way. Without it, every failover would carry a double-spend risk.
+
+### 16.2 Service replicas
+
+**Target: ≥ 3 replicas spread across ≥ 3 availability zones.**
+
+Three rather than two, because a rolling deploy voluntarily removes one: at two replicas a
+deploy leaves no headroom for a concurrent failure, and losing one instance halves capacity.
+At three across zones, a zone outage costs a third.
+
+| Concern | Setting |
+|---|---|
+| Spread | `topologySpreadConstraints` on `topology.kubernetes.io/zone` |
+| Voluntary disruption | `PodDisruptionBudget` with `minAvailable: 2` |
+| Readiness | `/actuator/health/readiness` — fails when Postgres is unreachable, so the instance leaves the load balancer |
+| Liveness | `/actuator/health/liveness` — must **not** depend on Postgres |
+| Shutdown | `server.shutdown=graceful` plus `terminationGracePeriodSeconds` above the longest request |
+
+The split between the two probes is not cosmetic. If liveness depended on Postgres, a database
+outage would make Kubernetes kill and restart every replica simultaneously — a restart storm
+that adds connection-stampede load exactly when the database is already struggling, and
+lengthens the outage. The correct behaviour is to stop accepting traffic while staying alive,
+ready to serve the moment the database returns.
+
+**The connection-pool trap.** Pool size multiplies by replica count: 20 connections × 12
+replicas is 240 connections, against a default Postgres `max_connections` of 100. Scaling out
+to improve availability would take the database down. Production needs either a reduced
+per-replica pool or **PgBouncer in transaction pooling mode**.
+
+Transaction pooling is compatible with this design precisely because it keeps no session state
+across transactions — but it has a direct consequence for the lock timeout: a session-level
+`SET lock_timeout` does not survive, since the backend is handed to another client between
+transactions. The timeout must be applied **inside** the transaction as `SET LOCAL
+lock_timeout`, which is how the `payment.lock-timeout` property should be implemented in
+Stage 2.
+
+### 16.3 PostgreSQL
+
+"Distributed database" covers two architectures with materially different consequences, and the
+distinction matters here.
+
+**Primary with synchronous standbys** — Patroni/repmgr, or managed (RDS Multi-AZ, Cloud SQL HA,
+Aurora). A single writer, so `SELECT ... FOR UPDATE` keeps *exactly* the semantics this design
+relies on. Failover is 10–60 seconds depending on the stack.
+
+```
+synchronous_commit = on
+synchronous_standby_names = 'ANY 1 (standby_a, standby_b)'
+```
+
+This gives **RPO = 0**: a payment acknowledged to the client survives the loss of the primary,
+because commit does not return until at least one standby has the WAL record. That is not free
+— every commit now includes a network round trip, which shows up in p99 latency. For a payment
+system it is the right trade: asynchronous replication means a window in which a customer was
+told their payment succeeded and the record no longer exists. Money cannot be eventually
+consistent with itself.
+
+**Distributed SQL** — CockroachDB, YugabyteDB, Spanner. Scales writes horizontally and
+survives node loss transparently, but **migrating is not a configuration change**:
+
+- `SELECT ... FOR UPDATE` becomes a distributed lock, paying consensus latency per payment —
+  single-digit milliseconds becomes tens, more across regions.
+- Serializable isolation surfaces **retryable transaction conflicts** (SQLSTATE `40001`). The
+  application *must* retry them. The current code would surface them as `500`s, so a retry
+  wrapper around the payment transaction is mandatory before such a move.
+
+For this workload a single synchronously-replicated primary is the right answer, and if one
+primary ever saturates, **sharding by account id** is the escape hatch — available precisely
+because no transaction spans accounts.
+
+**Client-side requirements for failover to actually work:**
+
+```
+jdbc:postgresql://pg-a:5432,pg-b:5432,pg-c:5432/payment?targetServerType=primary
+```
+
+plus Hikari validation to evict connections to the demoted node. Without this, replicas keep
+handing out connections to a server that is no longer the primary and every write fails.
+
+### 16.4 Kafka
+
+**Target: ≥ 3 brokers, one per availability zone.**
+
+| Setting | Production value | Why |
+|---|---|---|
+| `replication.factor` | `3` | Survives one broker loss with a replica to spare |
+| `min.insync.replicas` | `2` | A write is durable on two brokers before acknowledgement |
+| `acks` (producer) | `all` | Acknowledge only once `min.insync.replicas` have it |
+| `unclean.leader.election.enable` | `false` | **Critical** |
+| `broker.rack` | per-AZ identifier | Makes RF=3 mean three zones, not three machines in one rack |
+| `transaction.state.log.replication.factor` | `3` | Defaults to 1 — a production footgun |
+| Streams `replication.factor` | `3` | Applies to changelog topics; also defaults to 1 |
+| Streams `num.standby.replicas` | `≥ 1` | See below |
+
+`unclean.leader.election.enable=false` deserves emphasis: set to `true`, an out-of-sync replica
+may be elected leader, **silently discarding committed events**. For payment notifications that
+means a customer never hears about a payment that definitely happened. The correct failure mode
+is to make the partition unavailable rather than to lose data.
+
+The RF=3 / ISR=2 combination tolerates exactly one broker loss while still accepting writes.
+Lose two and the partition goes read-only — producers receive `NOT_ENOUGH_REPLICAS`. That is
+the intended behaviour: refuse data that cannot be stored durably rather than accept it and
+hope.
+
+**Partition count must be over-provisioned from the start**, for two reasons that are easy to
+discover too late:
+
+1. Partition count caps consumer parallelism. A consumer group can run at most one instance per
+   partition, so 3 partitions means the notification service cannot usefully scale past 3
+   instances no matter how far behind it falls.
+2. Partitions can be increased but **never decreased**, and increasing them **breaks key→
+   partition affinity**. Keys rehash, so an account's existing events stay on the old partition
+   while new ones land elsewhere — which breaks the per-account ordering the key design exists
+   to provide, permanently for the straddling window.
+
+So `payment-events` should be created with 12–24 partitions rather than grown later. Rough
+sizing: at least as many partitions as peak expected consumer instances, around one partition
+per 10 MB/s of target throughput, keeping the per-broker total in the low thousands.
+
+**Streams state recovery is the notification service's main HA lever.** The deduplication store
+is backed by a changelog topic. Without standby replicas, an instance failure means the
+replacement replays that changelog from scratch before processing resumes — minutes of
+notification delay proportional to state size. `num.standby.replicas: 1` keeps a warm copy on
+another instance and turns that into seconds. Pair it with static group membership
+(`group.instance.id`) so rolling restarts do not trigger full rebalances.
+
+### 16.5 The outbox relay across replicas
+
+The relay needs **no leader election and no coordination**: `SELECT ... FOR UPDATE SKIP LOCKED`
+means each replica claims a disjoint batch, and a replica that dies mid-batch simply releases
+its locks when the connection closes, so another picks the rows up on the next poll. This is an
+unusually clean horizontal-scaling story and it comes from one SQL clause.
+
+**One honest caveat.** With multiple relay replicas polling concurrently, two replicas can
+claim two payments for the *same account* at the same time and publish them in either order. So
+although events are keyed by account id — which guarantees Kafka *stores* them on one partition
+— the published order may not match database commit order.
+
+For the notification use case this is harmless: the consumer deduplicates by payment id and
+does not care about order. The design accepts it deliberately. But any future order-sensitive
+consumer (a running-balance projection, say) would need the relay sharded by key, e.g.:
+
+```sql
+WHERE published_at IS NULL
+  AND next_attempt_at <= now()
+  AND abs(hashtext(partition_key)) % :relay_count = :relay_index
+```
+
+which gives one relay sole ownership of a given account's events, restoring order at the cost
+of coordinating shard assignment. Stating the limitation is more useful than implying an
+ordering guarantee the relay does not provide.
+
+### 16.6 Behaviour under failure
+
+This is what "highly available" actually means in operation:
+
+| Failure | Observed behaviour | Recovery |
+|---|---|---|
+| **One service replica** | Removed from the load balancer. In-flight requests fail; clients retry with the same `Idempotency-Key`, so no double spend. Capacity drops by 1/N. | Automatic; orchestrator reschedules |
+| **Postgres primary** | In-flight transactions abort. API returns `503` for 10–60s. Committed payments intact (RPO 0). Retries with the same key resolve to the original outcome. | Automatic promotion |
+| **One Kafka broker** | Producers continue (ISR still ≥ 2). Brief `NOT_LEADER_FOR_PARTITION` retries, handled inside the client. | Automatic leader election |
+| **Two Kafka brokers** | Publishing stops (`NOT_ENOUGH_REPLICAS`). Outbox rows accumulate, `attempts` increments with backoff. **Payments keep succeeding and returning `201`.** Notifications are delayed, not lost. | Relay drains the backlog automatically |
+| **Kafka entirely down** | As above. The one SLI that detects this is outbox depth — the API looks perfectly healthy. | Relay drains on recovery |
+| **Notification service down** | Consumer lag grows; events sit in the topic for their 7-day retention. Zero payment impact. | Restart; state restored from changelog (seconds with a standby, minutes without) |
+| **Relay replica mid-batch** | Row locks release on connection close. Another replica reclaims them. If it died after publishing but before marking, the event republishes and the consumer deduplicates. | Automatic |
+| **One availability zone** | A third of replicas and one broker lost; Postgres fails over if the primary was there. Degraded capacity, no data loss. | Automatic |
+| **Whole region** | Not covered by multi-AZ HA — see §16.8. | Manual DR |
+
+The Kafka rows are the point worth dwelling on. **A total Kafka outage does not stop payments**,
+because the outbox makes event publication asynchronous and recoverable. The system degrades
+(notifications arrive late) instead of failing (payments rejected). That is why Kafka is
+deliberately excluded from the readiness probe, and it is the single most valuable
+fault-tolerance property in the design.
+
+**What must be alerted on** for this to be real rather than theoretical:
+
+- **Outbox depth and age of the oldest unpublished row** — the primary SLI. A stuck relay is
+  completely invisible from the API: payments succeed, notifications silently stop.
+- Consumer group lag on `payment-events`.
+- Postgres replication lag; count of synchronous standbys in sync.
+- Kafka under-replicated partitions and ISR shrink events.
+- Ready replica count against desired.
+- Rate of `503`s from lock timeouts — rising values indicate contention on hot accounts.
+
+### 16.7 Configuration: development versus production
+
+| | This repository | Production |
+|---|---|---|
+| Service replicas | 1 | ≥ 3, across ≥ 3 AZs |
+| Postgres | 1 container | Primary + ≥ 2 synchronous standbys, multi-AZ |
+| `synchronous_commit` | `on` (no standby) | `on` with `synchronous_standby_names` |
+| Connection pooling | Hikari only | Hikari + PgBouncer (transaction mode) |
+| Kafka brokers | 1 | ≥ 3, one per AZ, `broker.rack` set |
+| Replication factor | 1 | 3 |
+| `min.insync.replicas` | 1 (default) | 2 |
+| `unclean.leader.election` | default | `false` |
+| Partitions (`payment-events`) | 3 | 12–24 |
+| Streams standby replicas | 0 | ≥ 1 |
+| Kafka security | PLAINTEXT | mTLS + SASL, ACLs per principal |
+| Schema management | Flyway on startup | Separate migration step before rollout |
+| Schema compatibility | none | Schema Registry, backward-compatible |
+
+Two of these are more than tuning. **Flyway on application startup** is convenient locally but
+wrong for a fleet: a failed migration during a rolling deploy can prevent every replica from
+starting, converting a bad migration into a total outage. Production runs migrations as a
+discrete, gated step. And **migrations must be backward compatible with the running version**,
+because a rolling deploy means old and new code query the same schema simultaneously — which
+makes column drops and renames a multi-release expand/contract sequence rather than a single
+change.
+
+### 16.8 What high availability does not provide
+
+Worth stating plainly, because "HA" is often read as "nothing can go wrong":
+
+- **Multi-AZ is not multi-region.** Surviving a region loss needs cross-region replication,
+  which is asynchronous over that distance and therefore **RPO > 0** — a bounded window of
+  acknowledged payments that may not survive. For a payment system that is not an engineering
+  detail but a documented reconciliation procedure. Active-active multi-region is not viable
+  with `SELECT FOR UPDATE` at all, since the lock would pay inter-region latency; it requires
+  sharding accounts to a home region.
+- **HA does not protect against bad deploys or data corruption**, which it faithfully
+  replicates to every replica. That needs backups with point-in-time recovery — and the
+  append-only `payment` journal is what makes state reconstructable after a logical error,
+  which is a large part of why the journal is append-only.
+- **HA is not capacity.** Three replicas sized for peak load have no headroom when one is lost.
+  Replica count must account for the failure case, not just the steady state.
