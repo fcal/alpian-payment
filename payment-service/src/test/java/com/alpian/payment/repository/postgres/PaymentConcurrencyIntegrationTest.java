@@ -228,7 +228,10 @@ class PaymentConcurrencyIntegrationTest extends PostgresTestBase {
     PaymentResult result = service.submit(request("50.00", "key-1"));
 
     assertThat(result).isInstanceOf(PaymentResult.Declined.class);
-    Payment stored = payments.findById(result.journalEntry().orElseThrow().id()).orElseThrow();
+    Payment stored =
+        payments
+            .findByIdAndAccountId(result.journalEntry().orElseThrow().id(), account)
+            .orElseThrow();
     assertThat(stored.status()).isEqualTo(PaymentStatus.FAILED);
     assertThat(stored.failureReasonIfAny()).contains("Insufficient funds");
     assertThat(balance()).isEqualTo(Money.of("10.00", "CHF"));
@@ -241,11 +244,24 @@ class PaymentConcurrencyIntegrationTest extends PostgresTestBase {
 
     PaymentResult result = service.submit(request("123.45", "key-1"));
     Payment original = result.journalEntry().orElseThrow();
-    Payment reloaded = payments.findById(original.id()).orElseThrow();
+    Payment reloaded = payments.findByIdAndAccountId(original.id(), account).orElseThrow();
 
     // Equality across the whole record, which also pins down that Money survives NUMERIC(19,4)
     // and that the timestamp survives TIMESTAMPTZ.
     assertThat(reloaded).isEqualTo(original);
+  }
+
+  @Test
+  @DisplayName("a payment is not found through an account it was not made from")
+  void scopesPaymentLookupToItsAccount() {
+    givenBalance("1000.00");
+    Payment payment = service.submit(request("10.00", "key-1")).journalEntry().orElseThrow();
+    AccountId other = new AccountId(UUID.randomUUID());
+    accounts.save(new Account(other, owner, Money.of("0.00", "CHF"), Instant.now(), Instant.now()));
+
+    // Even an account belonging to the same user: the payment was made from `account`.
+    assertThat(payments.findByIdAndAccountId(payment.id(), other)).isEmpty();
+    assertThat(payments.findByIdAndAccountId(payment.id(), account)).isPresent();
   }
 
   private void givenBalance(String amount) {

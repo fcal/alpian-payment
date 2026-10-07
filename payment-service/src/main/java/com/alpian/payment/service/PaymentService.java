@@ -110,8 +110,10 @@ public class PaymentService {
       PaymentRequest request, DuplicateIdempotencyKeyException cause) {
     Optional<Payment> winner =
         payments.findByAccountIdAndIdempotencyKey(request.accountId(), request.idempotencyKey());
+    // The winner may have been a different payment under the same key; the same rule applies as
+    // for an ordinary replay.
     return winner
-        .<PaymentResult>map(PaymentResult.Replayed::new)
+        .map(recorded -> PaymentExecutor.replayOrRefuse(request, recorded))
         // The constraint fired, so a committed row must exist by the time this new transaction
         // starts. Absent means an assumption is broken somewhere; rethrowing surfaces that rather
         // than inventing a result.

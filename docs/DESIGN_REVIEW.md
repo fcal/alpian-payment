@@ -284,14 +284,14 @@ Protobuf is a good choice (compact, evolvable, consistent with the reference rep
 
 "Error Handling" is a stated focus area, but the brief specifies no error contract at all.
 
-- **HTTP contract** via RFC 7807 `ProblemDetail` (built into Spring 6) and a
+- **HTTP contract** via RFC 9457 `ProblemDetail` (built into Spring 6) and a
   `@RestControllerAdvice`:
   | Condition | Status |
   |---|---|
   | Malformed / invalid body, non-positive amount | `400` |
   | Unknown account | `404` |
   | Insufficient funds | `409` |
-  | Idempotency key reused with a different payload | `409` |
+  | Idempotency key reused with a different payload | `422` (see Stage 3 findings) |
   | Currency mismatch | `422` |
   | Lock timeout / contention | `503` + `Retry-After` |
 - **Account ownership check.** `userId` in the path is only meaningful if the service verifies
@@ -472,6 +472,38 @@ payment.
 DTOs and mappers, controller, `@RestControllerAdvice` + `ProblemDetail`, idempotency handling,
 account-ownership check, springdoc OpenAPI.
 **Exit:** documented API, `@WebMvcTest` coverage of every error path, Swagger UI live.
+
+**Findings during implementation.**
+
+1. **A replay could leak another user's payment.** Stages 1 and 2 checked the idempotency key
+   *before* verifying account ownership. A user addressing someone else's account with a key that
+   account had used received the stored payment — beneficiary, amount, reference — as a "replay".
+   Ownership is now established before anything is read on the account's behalf, with regression
+   tests at both the service and HTTP layers. Worth recording that the API design surfaced this,
+   not the earlier stages' tests: those tested replay and ownership separately, never together.
+2. **Key reuse with a different payload was silently replayed.** A client reusing a key for a
+   new payment would have been told that payment succeeded when it was never attempted. It is now
+   refused with `422` and `code: idempotency_key_reused`. The comparison is on normalised values,
+   so `250.0` versus `250.00` or a re-spaced IBAN is still recognised as the same request. `422`
+   rather than the `409` in §8, following the IETF `Idempotency-Key` header draft, which reserves
+   `409` for a concurrent request still in flight.
+3. **The response `code` must not be the raw outcome.** Mapping `PaymentOutcome` straight to the
+   problem `code` would have sent `account_not_owned` to the client — undoing the non-disclosure
+   the service carefully preserves. Both cases render as `account_not_found`; a test asserts the
+   two responses are byte-identical.
+4. **Money rendered as a JSON number by default.** `BigDecimal` serialises as a number unless told
+   otherwise, which would put amounts straight into the client's floating point. Fixed with
+   `@JsonFormat(shape = STRING)`; the test asserts on raw response text, since `jsonPath` coerces
+   numbers and strings to the same value and would pass with the defect present.
+5. **Framework problems arrived without a `code`.** Spring's base handler builds the
+   `ProblemDetail` inside `handleExceptionInternal`, after an override inspecting `body` has
+   already run, so enrichment has to happen on the response `super` returns.
+
+**Deviation from §9.** Payment retrieval is
+`GET /api/v1/users/{userId}/accounts/{accountId}/payments/{paymentId}` rather than the top-level
+`/api/v1/payments/{paymentId}`, so the same ownership check applies. A top-level path would have
+needed the check to be reconstructed from the payment alone, and the account match matters too:
+without it, any payment could be read by pairing its id with one of the caller's *own* accounts.
 
 ### Stage 4 — Outbox → Kafka
 `proto` module and `Money` representation, protobuf serdes, outbox relay poller with backoff and
@@ -852,7 +884,7 @@ JVM memory and GC, and Kafka client metrics.
 
 The `outcome` tag takes its values from the `PaymentOutcome` enum: `completed`,
 `insufficient_funds`, `currency_mismatch`, `account_not_found`, `account_not_owned`,
-`idempotent_replay`, `lock_timeout`, `validation_failed`.
+`idempotent_replay`, `idempotency_key_reused`, `lock_timeout`, `validation_failed`.
 
 Notification-service counters (`notification_events_total{outcome}`, with
 `duplicate_suppressed` as a value, and `notification_dlt_total`) arrive with the topology in

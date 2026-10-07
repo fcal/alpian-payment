@@ -17,8 +17,8 @@ Implemented in stages; each stage is independently buildable and green.
 | 0 | Build skeleton, local stack, schema migrations | ✅ Done |
 | 1 | Domain model, repository contract, in-memory implementation | ✅ Done |
 | 2 | PostgreSQL implementation, row locking, concurrency tests | ✅ Done |
-| 3 | REST API, error contract, OpenAPI | ⏳ Next |
-| 4 | Outbox relay → Kafka | — |
+| 3 | REST API, error contract, OpenAPI | ✅ Done |
+| 4 | Outbox relay → Kafka | ⏳ Next |
 | 5 | Notification service (Kafka Streams deduplication) | — |
 | 6 | End-to-end component tests | — |
 | 7 | Documentation and CI | — |
@@ -136,6 +136,62 @@ Timestamps are `TIMESTAMPTZ`.
 Migrations are plain SQL under
 [`payment-service/src/main/resources/db/migration`](payment-service/src/main/resources/db/migration)
 and build the schema from scratch.
+
+## REST API
+
+Interactive documentation is served at **`/swagger-ui.html`**, and the OpenAPI document at
+**`/v3/api-docs`**.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/users/{userId}/accounts/{accountId}/balance` | Current balance |
+| `POST` | `/api/v1/users/{userId}/accounts/{accountId}/payments` | Submit a payment (`Idempotency-Key` header required) |
+| `GET` | `/api/v1/users/{userId}/accounts/{accountId}/payments/{paymentId}` | Retrieve a payment, completed or declined |
+
+`userId` in the path stands in for authentication, which is out of scope. In production it must
+come from a validated JWT subject, never from the URL. The ownership check behind it is real:
+an account is only ever read or debited for its owner, and an account belonging to someone else
+returns the same `404` as one that does not exist.
+
+### Trying it
+
+With the service running, against the seeded demo account:
+
+```bash
+BASE=localhost:8080/api/v1/users/11111111-1111-1111-1111-111111111111/accounts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1
+
+curl -s $BASE/balance
+
+curl -si -X POST $BASE/payments \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"amount":{"value":"250.50","currency":"CHF"},
+       "beneficiary":{"name":"Acme GmbH","iban":"CH93 0076 2011 6238 5295 7"},
+       "reference":"Invoice 42"}'
+```
+
+Sending the same request again with the same key returns the original `201` and body, with
+`Idempotent-Replayed: true`, and does not debit again.
+
+### Responses
+
+| Status | When | `code` |
+|---|---|---|
+| `201` | Payment completed | — |
+| `400` | Malformed body, invalid field, missing or over-long `Idempotency-Key` | `validation_failed` |
+| `404` | No such account for this user (or not theirs) | `account_not_found` |
+| `409` | Declined for insufficient funds; the attempt is recorded, `paymentId` and `Location` identify it | `insufficient_funds` |
+| `422` | Currency differs from the account's | `currency_mismatch` |
+| `422` | Idempotency key already used for a *different* payment | `idempotency_key_reused` |
+| `503` | Another payment on the account is in flight; retry after `Retry-After` with the same key | `lock_timeout` |
+
+Errors are RFC 9457 problem details. Clients should branch on `code`, which is stable, rather
+than on `detail`, which is prose. A replay returns the original status, so a client retrying after
+a timeout receives exactly the response it missed — including a `409` if the original was declined.
+
+Monetary values are decimal strings in responses (`"250.50"`), rendered at the currency's
+minor-unit precision, so a client's JSON parser does not turn them into floating point. Requests
+accept a string or a number; more than four decimal places is refused rather than rounded.
 
 ## High availability
 

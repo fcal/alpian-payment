@@ -37,6 +37,13 @@ public enum PaymentOutcome {
   IDEMPOTENT_REPLAY("idempotent_replay"),
 
   /**
+   * The idempotency key had already been used for a <em>different</em> payment. Replaying the
+   * stored outcome would tell the client a payment it never made had succeeded, so the request is
+   * refused instead.
+   */
+  IDEMPOTENCY_KEY_REUSED("idempotency_key_reused"),
+
+  /**
    * The per-account row lock was not acquired within the configured timeout, so the request was
    * rejected rather than left queueing and holding a connection. A rising rate indicates contention
    * on a hot account.
@@ -77,6 +84,7 @@ public enum PaymentOutcome {
               ACCOUNT_NOT_FOUND,
               ACCOUNT_NOT_OWNED,
               IDEMPOTENT_REPLAY,
+              IDEMPOTENCY_KEY_REUSED,
               LOCK_TIMEOUT,
               VALIDATION_FAILED ->
           Optional.empty();

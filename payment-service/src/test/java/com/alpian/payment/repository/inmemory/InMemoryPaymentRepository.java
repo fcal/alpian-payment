@@ -45,8 +45,8 @@ public class InMemoryPaymentRepository implements PaymentRepository {
   }
 
   @Override
-  public Optional<Payment> findById(PaymentId id) {
-    return Optional.ofNullable(byId.get(id));
+  public Optional<Payment> findByIdAndAccountId(PaymentId id, AccountId accountId) {
+    return Optional.ofNullable(byId.get(id)).filter(p -> p.accountId().equals(accountId));
   }
 
   @Override
@@ -56,7 +56,7 @@ public class InMemoryPaymentRepository implements PaymentRepository {
         // The index is claimed a moment before the row is published, so a concurrent reader can
         // observe the claim without the row. flatMap yields empty in that window rather than
         // throwing, which matches what a real transaction would show: nothing committed yet.
-        .flatMap(this::findById);
+        .map(byId::get);
   }
 
   @Override

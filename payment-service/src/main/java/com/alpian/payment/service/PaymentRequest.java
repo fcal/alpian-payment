@@ -4,6 +4,7 @@ import com.alpian.payment.domain.AccountId;
 import com.alpian.payment.domain.Beneficiary;
 import com.alpian.payment.domain.IdempotencyKey;
 import com.alpian.payment.domain.Money;
+import com.alpian.payment.domain.Payment;
 import com.alpian.payment.domain.UserId;
 import java.util.Objects;
 
@@ -54,5 +55,21 @@ public record PaymentRequest(
       // missing reference and a whitespace one.
       reference = null;
     }
+  }
+
+  /**
+   * Whether {@code recorded} is the payment this request describes, so that replaying it is
+   * correct.
+   *
+   * <p>Compares what the payer asked for — amount, beneficiary, reference — rather than anything
+   * the service assigned. Equivalence rather than textual identity: {@link Money} and {@link
+   * Beneficiary} are normalised on construction, so a client re-serialising {@code 250.0} as {@code
+   * 250.00}, or re-spacing an IBAN, is still recognised as the same request.
+   */
+  public boolean describes(Payment recorded) {
+    return recorded.accountId().equals(accountId)
+        && recorded.amount().equals(amount)
+        && recorded.beneficiary().equals(beneficiary)
+        && Objects.equals(recorded.reference(), reference);
   }
 }

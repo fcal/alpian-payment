@@ -68,16 +68,9 @@ public class PaymentExecutor {
    */
   @Transactional(propagation = Propagation.REQUIRED)
   public PaymentResult execute(PaymentRequest request, PaymentId paymentId) {
-    // Inside the transaction, so a replay found here is committed data. It is still not
-    // authoritative under concurrency -- two requests can both see nothing -- and the unique
-    // constraint on append() is what settles that.
-    Optional<Payment> alreadyRecorded =
-        payments.findByAccountIdAndIdempotencyKey(request.accountId(), request.idempotencyKey());
-    if (alreadyRecorded.isPresent()) {
-      log.info("Idempotent replay of key {}", request.idempotencyKey());
-      return new PaymentResult.Replayed(alreadyRecorded.get());
-    }
-
+    // Ownership is established before anything is read on the account's behalf -- including the
+    // replay lookup. In the other order, a user addressing someone else's account with a key that
+    // account had used would be handed the stored payment as a "replay".
     Optional<Account> maybeAccount = accounts.findById(request.accountId());
     if (maybeAccount.isEmpty()) {
       return new PaymentResult.Rejected(PaymentOutcome.ACCOUNT_NOT_FOUND, "Account not found");
@@ -93,6 +86,15 @@ public class PaymentExecutor {
       // itself a disclosure. The distinction is kept in the metric and this log, where it is
       // useful, and dropped from the response, where it leaks.
       return new PaymentResult.Rejected(PaymentOutcome.ACCOUNT_NOT_OWNED, "Account not found");
+    }
+
+    // Inside the transaction, so a replay found here is committed data. It is still not
+    // authoritative under concurrency -- two requests can both see nothing -- and the unique
+    // constraint on append() is what settles that.
+    Optional<Payment> alreadyRecorded =
+        payments.findByAccountIdAndIdempotencyKey(request.accountId(), request.idempotencyKey());
+    if (alreadyRecorded.isPresent()) {
+      return PaymentExecutor.replayOrRefuse(request, alreadyRecorded.get());
     }
 
     // Checked here only to produce a message naming both currencies; the debit checks it again
@@ -164,5 +166,26 @@ public class PaymentExecutor {
                   .formatted(
                       request.amount().currencyCode(), mismatch.accountBalance().currencyCode()));
     };
+  }
+
+  /**
+   * Resolves a request whose key has already been used.
+   *
+   * <p>A key identifies one request, so a repeat is a replay only if it describes the same payment.
+   * Replaying a stored outcome for a <em>different</em> request would tell the client that a
+   * payment it never made had succeeded — or that one which might have succeeded had failed.
+   */
+  static PaymentResult replayOrRefuse(PaymentRequest request, Payment recorded) {
+    if (!request.describes(recorded)) {
+      log.warn(
+          "Idempotency key {} reused on account {} for a different payment",
+          request.idempotencyKey(),
+          request.accountId());
+      return new PaymentResult.Rejected(
+          PaymentOutcome.IDEMPOTENCY_KEY_REUSED,
+          "Idempotency key has already been used for a different payment");
+    }
+    log.info("Idempotent replay of key {}", request.idempotencyKey());
+    return new PaymentResult.Replayed(recorded);
   }
 }

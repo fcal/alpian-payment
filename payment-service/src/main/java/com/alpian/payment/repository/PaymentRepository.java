@@ -24,7 +24,14 @@ public interface PaymentRepository {
    */
   Payment append(Payment payment);
 
-  Optional<Payment> findById(PaymentId id);
+  /**
+   * Finds a payment made from a given account.
+   *
+   * <p>Deliberately no unscoped {@code findById}. Every read of a payment states which account it
+   * belongs to, so the scoping is part of the query rather than a filter a caller might forget —
+   * and another account's payment is never loaded at all, rather than loaded and discarded.
+   */
+  Optional<Payment> findByIdAndAccountId(PaymentId id, AccountId accountId);
 
   /** Finds a previously recorded attempt under the same key, for idempotent replay. */
   Optional<Payment> findByAccountIdAndIdempotencyKey(AccountId accountId, IdempotencyKey key);

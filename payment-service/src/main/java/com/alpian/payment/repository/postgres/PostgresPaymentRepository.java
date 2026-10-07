@@ -38,7 +38,8 @@ public class PostgresPaymentRepository implements PaymentRepository {
               :status, :failureReason, :createdAt)
       """;
 
-  private static final String FIND_BY_ID = "SELECT " + COLUMNS + " FROM payment WHERE id = :id";
+  private static final String FIND_BY_ID_AND_ACCOUNT =
+      "SELECT " + COLUMNS + " FROM payment WHERE id = :id AND account_id = :accountId";
 
   private static final String FIND_BY_IDEMPOTENCY_KEY =
       "SELECT "
@@ -89,9 +90,10 @@ public class PostgresPaymentRepository implements PaymentRepository {
   }
 
   @Override
-  public Optional<Payment> findById(PaymentId id) {
-    return jdbc.sql(FIND_BY_ID)
+  public Optional<Payment> findByIdAndAccountId(PaymentId id, AccountId accountId) {
+    return jdbc.sql(FIND_BY_ID_AND_ACCOUNT)
         .param("id", id.value())
+        .param("accountId", accountId.value())
         .query(PostgresPaymentRepository::mapPayment)
         .optional();
   }

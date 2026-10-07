@@ -27,6 +27,13 @@ spring:
 
   jackson:
     default-property-inclusion: non_null
+    generator:
+      # Never render a BigDecimal in exponent notation ("1E+3"), which some clients mis-parse.
+      write-bigdecimal-as-plain: true
+    deserialization:
+      # A payment request with an unexpected field is more likely a client bug -- a misspelt
+      # "refrence" silently dropped -- than forward compatibility, so it is rejected.
+      fail-on-unknown-properties: true
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
@@ -53,7 +60,7 @@ payment:
 
 server:
   error:
-    # Errors are rendered as RFC 7807 ProblemDetail by a @RestControllerAdvice; the default
+    # Errors are rendered as RFC 9457 ProblemDetail by a @RestControllerAdvice; the default
     # Whitelabel error attributes would leak implementation detail.
     whitelabel:
       enabled: false

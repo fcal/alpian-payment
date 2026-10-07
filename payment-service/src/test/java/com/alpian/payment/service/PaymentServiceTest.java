@@ -204,6 +204,59 @@ class PaymentServiceTest {
     }
 
     @Test
+    @DisplayName("another user cannot read a payment by replaying its idempotency key")
+    void replayDoesNotBypassOwnership() {
+      // Regression: the replay lookup used to run before the ownership check. A second user who
+      // addressed someone else's account with a key that account had used would receive the
+      // stored payment -- beneficiary, amount, reference -- as a "replay".
+      givenAccount("1000.00", "CHF");
+      service.submit(request("250.00", "CHF", "owners-key"));
+
+      PaymentResult intruder =
+          service.submit(
+              new PaymentRequest(
+                  SOMEONE_ELSE,
+                  ACCOUNT,
+                  new IdempotencyKey("owners-key"),
+                  Money.of("250.00", "CHF"),
+                  BENEFICIARY,
+                  "invoice 42"));
+
+      assertThat(intruder).isInstanceOf(PaymentResult.Rejected.class);
+      assertThat(intruder.outcome()).isEqualTo(PaymentOutcome.ACCOUNT_NOT_OWNED);
+      assertThat(intruder.journalEntry()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("reusing a key for a different payment is refused, not silently replayed")
+    void rejectsKeyReuseWithADifferentPayload() {
+      // Replaying the stored outcome for a request that differs from the original would tell the
+      // client its new payment succeeded when it was never attempted.
+      givenAccount("1000.00", "CHF");
+      service.submit(request("250.00", "CHF", "same-key"));
+
+      PaymentResult reused = service.submit(request("999.00", "CHF", "same-key"));
+
+      assertThat(reused).isInstanceOf(PaymentResult.Rejected.class);
+      assertThat(reused.outcome()).isEqualTo(PaymentOutcome.IDEMPOTENCY_KEY_REUSED);
+      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
+          .isEqualTo(Money.of("750.00", "CHF"));
+      assertThat(payments.size()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("an identical retry is still replayed, including an equivalent amount format")
+    void replaysEquivalentRequests() {
+      givenAccount("1000.00", "CHF");
+      service.submit(request("250.00", "CHF", "same-key"));
+
+      // 250.0 and 250.00 are the same money; a client re-serialising its request must not be
+      // treated as having changed it.
+      assertThat(service.submit(request("250.0", "CHF", "same-key")))
+          .isInstanceOf(PaymentResult.Replayed.class);
+    }
+
+    @Test
     @DisplayName("a different key on the same account is a different payment")
     void treatsDistinctKeysAsDistinctPayments() {
       givenAccount("1000.00", "CHF");
