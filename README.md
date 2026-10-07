@@ -15,8 +15,8 @@ Implemented in stages; each stage is independently buildable and green.
 | Stage | Scope | State |
 |---|---|---|
 | 0 | Build skeleton, local stack, schema migrations | ✅ Done |
-| 1 | Domain model, repository contract, in-memory implementation | ⏳ Next |
-| 2 | PostgreSQL implementation, row locking, concurrency tests | — |
+| 1 | Domain model, repository contract, in-memory implementation | ✅ Done |
+| 2 | PostgreSQL implementation, row locking, concurrency tests | ⏳ Next |
 | 3 | REST API, error contract, OpenAPI | — |
 | 4 | Outbox relay → Kafka | — |
 | 5 | Notification service (Kafka Streams deduplication) | — |

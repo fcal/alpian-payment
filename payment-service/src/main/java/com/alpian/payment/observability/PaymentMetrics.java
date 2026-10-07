@@ -1,5 +1,6 @@
 package com.alpian.payment.observability;
 
+import com.alpian.payment.domain.PaymentOutcome;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Gauge;
@@ -19,12 +20,12 @@ import org.springframework.stereotype.Component;
  *
  * <p>Centralised deliberately rather than scattering {@code registry.counter(...)} calls through
  * the code. Metric names are a published interface: dashboards, alert rules and SLOs reference
- * them, so a rename is a breaking change for whoever is on call. Declaring them in one place
- * keeps that interface reviewable, and keeps the naming consistent.
+ * them, so a rename is a breaking change for whoever is on call. Declaring them in one place keeps
+ * that interface reviewable, and keeps the naming consistent.
  *
- * <p>Names use Micrometer's dot-separated convention; the Prometheus registry translates them
- * to snake case and appends the relevant suffix, so {@code payment.attempts} is scraped as
- * {@code payment_attempts_total}.
+ * <p>Names use Micrometer's dot-separated convention; the Prometheus registry translates them to
+ * snake case and appends the relevant suffix, so {@code payment.attempts} is scraped as {@code
+ * payment_attempts_total}.
  */
 @Component
 public class PaymentMetrics {
@@ -41,7 +42,8 @@ public class PaymentMetrics {
 
   private final MeterRegistry registry;
 
-  private final Map<PaymentOutcome, Counter> attemptsByOutcome = new EnumMap<>(PaymentOutcome.class);
+  private final Map<PaymentOutcome, Counter> attemptsByOutcome =
+      new EnumMap<>(PaymentOutcome.class);
   private final Map<String, DistributionSummary> amountByCurrency = new ConcurrentHashMap<>();
 
   private final Timer execution;
@@ -127,9 +129,9 @@ public class PaymentMetrics {
   /**
    * Records the value of a completed payment, tagged by currency.
    *
-   * <p>Tagged rather than aggregated because summing across currencies produces a number that
-   * means nothing. Cardinality is safe: the tag is bounded by ISO 4217, and in practice by the
-   * currencies the accounts actually hold.
+   * <p>Tagged rather than aggregated because summing across currencies produces a number that means
+   * nothing. Cardinality is safe: the tag is bounded by ISO 4217, and in practice by the currencies
+   * the accounts actually hold.
    */
   public void recordAmount(String currency, BigDecimal amount) {
     amountByCurrency

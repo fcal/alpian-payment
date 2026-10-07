@@ -426,9 +426,21 @@ Domain types (`Money`, `Account`, `Payment` as records), intent-based repository
 
 ### Stage 2 — PostgreSQL implementation
 `JdbcClient` implementations: `FOR UPDATE` debit, conditional atomic update, `SKIP LOCKED`
-outbox claim. Testcontainers integration tests including **the N-thread single-account
-concurrency test**.
+outbox claim. The payment path becomes `@Transactional`, with the lock timeout applied as
+`SET LOCAL` inside the transaction (§16.2). Testcontainers integration tests including **the
+N-thread single-account concurrency test**.
+
 **Exit:** concurrency test green; balance never negative; exactly one payment per idempotency key.
+
+**Required, and specifically not provable in Stage 1:** with N concurrent requests sharing one
+idempotency key, the balance must fall by *exactly one* payment. Stage 1 showed that the service
+debits before appending to the journal, so every thread that loses the unique-key race has
+already moved money; only a transaction rolls those debits back. The in-memory doubles have no
+transaction, so they genuinely leave the account debited once per thread with a single journal
+entry — money gone with no record. Stage 1's test therefore asserts only that the key guard
+admits one writer, and this invariant is deferred here. It is the single most important
+assertion in the suite: it is the one that actually demonstrates that double spending is
+prevented.
 
 ### Stage 3 — REST API
 DTOs and mappers, controller, `@RestControllerAdvice` + `ProblemDetail`, idempotency handling,

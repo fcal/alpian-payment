@@ -2,6 +2,7 @@ package com.alpian.payment.observability;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.alpian.payment.domain.PaymentOutcome;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -32,7 +33,8 @@ class PaymentMetricsTest {
     // Guards the property that makes alerting work: an un-incremented counter is absent from a
     // Prometheus scrape, so a rule filtering on a rare outcome would have no series to evaluate
     // until that outcome first occurred -- precisely when the alert needs to already exist.
-    Counter counter = registry.find("payment.attempts").tag("outcome", outcome.tagValue()).counter();
+    Counter counter =
+        registry.find("payment.attempts").tag("outcome", outcome.tagValue()).counter();
 
     assertThat(counter).as("counter for outcome %s", outcome).isNotNull();
     assertThat(counter.count()).isZero();
