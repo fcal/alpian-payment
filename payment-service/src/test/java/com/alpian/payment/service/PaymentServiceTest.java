@@ -54,7 +54,13 @@ class PaymentServiceTest {
     accounts = new InMemoryAccountRepository(clock);
     payments = new InMemoryPaymentRepository();
     registry = new SimpleMeterRegistry();
-    service = new PaymentService(accounts, payments, new PaymentMetrics(registry), clock);
+    // PaymentExecutor is constructed directly, so its @Transactional is inert here. That is
+    // correct for these tests: the in-memory repositories have no transaction to join, and the
+    // business rules under test do not depend on one. The invariants that DO depend on it are
+    // asserted against real PostgreSQL in the repository integration tests.
+    service =
+        new PaymentService(
+            new PaymentExecutor(accounts, payments, clock), payments, new PaymentMetrics(registry));
   }
 
   private void givenAccount(String balance, String currency) {

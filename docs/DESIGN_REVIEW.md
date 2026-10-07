@@ -442,6 +442,32 @@ admits one writer, and this invariant is deferred here. It is the single most im
 assertion in the suite: it is the one that actually demonstrates that double spending is
 prevented.
 
+**Findings during implementation.** Three things surfaced that the plan did not anticipate:
+
+1. **Spring does not translate a PostgreSQL `lock_timeout` into `CannotAcquireLockException`.**
+   The driver raises a plain `PSQLException` rather than a JDBC 4 subclass, and the fallback
+   translator does not recognise SQLSTATE class `55`, so `55P03` arrived as
+   `UncategorizedSQLException`. The service's catch block would never have matched, and lock
+   contention would have surfaced as an opaque 500 instead of a retryable rejection. Found by
+   asserting the exception type empirically rather than from documentation; fixed with a custom
+   translator in `JdbcConfiguration`, which the integration tests share via a static factory so
+   they observe exactly the production mapping.
+2. **The transaction boundary has to sit below the service, not on it.** A unique-constraint
+   violation or lock timeout aborts the PostgreSQL transaction, so neither can be turned into a
+   result inside it. `PaymentExecutor` is the transactional core; `PaymentService` wraps it
+   non-transactionally and handles those two outcomes after rollback. A separate bean is also
+   what avoids Spring's self-invocation trap, which would leave `@Transactional` silently inert —
+   and an inert transaction disables the row lock too.
+3. **`FOR UPDATE` outside a transaction fails silently.** In autocommit the lock is released the
+   moment the select returns, so the code appears to work while providing no protection.
+   `PostgresAccountRepository.debit` therefore refuses to run without an active transaction, and
+   a context test confirms the container proxies `PaymentExecutor` so that guard never fires in
+   practice.
+
+The deferred Stage 1 assertion holds: 32 concurrent requests sharing one idempotency key yield
+one completed payment, 31 replays, one journal entry, and a balance reduced by exactly one
+payment.
+
 ### Stage 3 — REST API
 DTOs and mappers, controller, `@RestControllerAdvice` + `ProblemDetail`, idempotency handling,
 account-ownership check, springdoc OpenAPI.

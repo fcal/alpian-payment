@@ -62,7 +62,9 @@ class PaymentServiceConcurrencyTest {
     payments = new InMemoryPaymentRepository();
     service =
         new PaymentService(
-            accounts, payments, new PaymentMetrics(new SimpleMeterRegistry()), clock);
+            new PaymentExecutor(accounts, payments, clock),
+            payments,
+            new PaymentMetrics(new SimpleMeterRegistry()));
   }
 
   @Test
