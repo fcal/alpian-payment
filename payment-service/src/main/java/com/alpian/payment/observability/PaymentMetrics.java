@@ -7,11 +7,15 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.springframework.stereotype.Component;
 
@@ -39,6 +43,7 @@ public class PaymentMetrics {
   private static final String OUTBOX_PARKED = "payment.outbox.parked";
   private static final String OUTBOX_PENDING = "payment.outbox.pending";
   private static final String OUTBOX_OLDEST_AGE = "payment.outbox.oldest.pending.age";
+  private static final String RELAY_LAST_POLL_AGE = "payment.outbox.relay.last.poll.age";
 
   private final MeterRegistry registry;
 
@@ -53,15 +58,30 @@ public class PaymentMetrics {
   private final Counter outboxParked;
 
   /**
-   * Backlog gauges are sampled from these holders rather than from a query, so a scrape costs
-   * nothing. The relay refreshes them on each poll, which is already a database round trip.
+   * Backlog state, refreshed by the relay on each poll and read at scrape time, so a scrape costs
+   * nothing.
+   *
+   * <p>The oldest row is held as a <em>timestamp</em>, not as an age, and the age is computed when
+   * the gauge is read. The difference is the whole point of the gauge. Were the relay to store an
+   * age, a relay that stalled would leave it frozen at its last value — possibly zero — and the
+   * alert meant to detect a stalled relay could never fire. A timestamp keeps ageing on its own.
    */
   private final AtomicLong outboxPending = new AtomicLong();
 
-  private final AtomicLong outboxOldestPendingSeconds = new AtomicLong();
+  private final AtomicReference<Instant> oldestPendingCreatedAt = new AtomicReference<>();
 
-  public PaymentMetrics(MeterRegistry registry) {
+  /**
+   * When the relay last completed a poll. Initialised to startup, so a relay that never runs at all
+   * shows a growing age rather than none.
+   */
+  private final AtomicReference<Instant> lastRelayPoll;
+
+  private final Clock clock;
+
+  public PaymentMetrics(MeterRegistry registry, Clock clock) {
     this.registry = registry;
+    this.clock = clock;
+    this.lastRelayPoll = new AtomicReference<>(clock.instant());
 
     // Every outcome counter is registered up front, at zero. A counter that has never been
     // incremented is absent from the scrape entirely, so an alert such as
@@ -114,8 +134,17 @@ public class PaymentMetrics {
         .strongReference(true)
         .register(registry);
 
-    Gauge.builder(OUTBOX_OLDEST_AGE, outboxOldestPendingSeconds, AtomicLong::get)
+    Gauge.builder(OUTBOX_OLDEST_AGE, this, PaymentMetrics::oldestPendingAgeSeconds)
         .description("Age of the oldest unpublished outbox row")
+        .baseUnit("seconds")
+        .strongReference(true)
+        .register(registry);
+
+    // Covers the one case the oldest-age gauge cannot: a relay that died while the backlog was
+    // empty. Its last observation was "nothing pending", so oldest-age would read zero forever as
+    // new rows piled up unseen. Time since the last completed poll grows regardless.
+    Gauge.builder(RELAY_LAST_POLL_AGE, this, PaymentMetrics::lastPollAgeSeconds)
+        .description("Time since the outbox relay last completed a poll")
         .baseUnit("seconds")
         .strongReference(true)
         .register(registry);
@@ -171,13 +200,30 @@ public class PaymentMetrics {
   }
 
   /**
-   * Refreshes the backlog gauges. Called by the relay on each poll.
+   * Refreshes the backlog gauges. Called by the relay after each poll.
    *
-   * @param pending rows awaiting publication
-   * @param oldestAge age of the oldest such row, or {@link Duration#ZERO} when none are pending
+   * @param oldestCreatedAt creation time of the oldest pending row, empty when none are pending
    */
-  public void updateOutboxBacklog(long pending, Duration oldestAge) {
+  public void updateOutboxBacklog(long pending, Optional<Instant> oldestCreatedAt) {
     outboxPending.set(pending);
-    outboxOldestPendingSeconds.set(oldestAge.toSeconds());
+    oldestPendingCreatedAt.set(oldestCreatedAt.orElse(null));
+  }
+
+  /** Marks a completed relay poll. Not called when a poll fails, so a failing relay ages too. */
+  public void recordRelayPoll() {
+    lastRelayPoll.set(clock.instant());
+  }
+
+  private double oldestPendingAgeSeconds() {
+    Instant oldest = oldestPendingCreatedAt.get();
+    return oldest == null ? 0 : secondsSince(oldest);
+  }
+
+  private double lastPollAgeSeconds() {
+    return secondsSince(lastRelayPoll.get());
+  }
+
+  private double secondsSince(Instant instant) {
+    return Math.max(0, Duration.between(instant, clock.instant()).toMillis() / 1000.0);
   }
 }

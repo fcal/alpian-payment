@@ -18,8 +18,8 @@ Implemented in stages; each stage is independently buildable and green.
 | 1 | Domain model, repository contract, in-memory implementation | ✅ Done |
 | 2 | PostgreSQL implementation, row locking, concurrency tests | ✅ Done |
 | 3 | REST API, error contract, OpenAPI | ✅ Done |
-| 4 | Outbox relay → Kafka | ⏳ Next |
-| 5 | Notification service (Kafka Streams deduplication) | — |
+| 4 | Outbox relay → Kafka | ✅ Done |
+| 5 | Notification service (Kafka Streams deduplication) | ⏳ Next |
 | 6 | End-to-end component tests | — |
 | 7 | Documentation and CI | — |
 
@@ -193,6 +193,45 @@ Monetary values are decimal strings in responses (`"250.50"`), rendered at the c
 minor-unit precision, so a client's JSON parser does not turn them into floating point. Requests
 accept a string or a number; more than four decimal places is refused rather than rounded.
 
+## Event publication
+
+Payments publish a `PaymentEvent` (protobuf, defined in [`proto/`](proto)) to the
+`payment-events` topic, for both completed and declined payments. Replays and rejected requests
+publish nothing.
+
+**Transactional outbox.** The event row is written in the same database transaction as the debit
+and the journal entry, so an event exists if and only if its payment committed. A relay polls the
+outbox and publishes to Kafka afterwards. The payment path never talks to Kafka, which is why a
+broker outage delays notifications but cannot fail a payment.
+
+**Relay.** Every replica runs one. Batches are claimed with `SELECT ... FOR UPDATE SKIP LOCKED`, so
+concurrent relays take disjoint rows with no coordination. Delivery is at-least-once: if Kafka
+acknowledges a batch and the commit marking it fails, it is sent again, and consumers deduplicate
+on the `payment-id` header.
+
+**Failures.** Retriable errors — an unreachable broker, a leader election — are retried with
+exponential backoff capped at one minute, indefinitely and never parked. Otherwise a long outage
+would park the whole backlog and need it replayed by hand. Non-retriable errors, such as a record
+too large, are parked after `payment.outbox.max-attempts` so one poison message cannot block the
+queue; parked rows have `parked_at` set and `last_error` explaining why.
+
+**Records** are keyed by account id and carry `payment-id`, `event-type` and `content-type`
+headers. To watch them with the values decoded (needs `brew install kcat protobuf`):
+
+```bash
+scripts/tail-events.sh       # every record so far, then exit
+scripts/tail-events.sh -f    # keep following new records
+```
+
+Without those tools, Kafka's console consumer shows the key and headers, though the protobuf
+value prints as raw bytes:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic payment-events --from-beginning \
+  --property print.key=true --property print.headers=true
+```
+
 ## High availability
 
 This repository runs a development topology: one service instance, one PostgreSQL container,
@@ -244,6 +283,7 @@ client), the application registers:
 | `payment_lock_wait_seconds` | timer | Time waiting for the per-account row lock |
 | `payment_outbox_pending` | gauge | Rows awaiting publication |
 | `payment_outbox_oldest_pending_age_seconds` | gauge | Age of the oldest unpublished row |
+| `payment_outbox_relay_last_poll_age_seconds` | gauge | Time since the relay last completed a poll |
 | `payment_outbox_published_total` | counter | Rows published successfully |
 | `payment_outbox_publish_failures_total` | counter | Failed publication attempts |
 | `payment_outbox_parked_total` | counter | Rows parked after exhausting retries |
@@ -253,7 +293,9 @@ rather than merely present:
 
 - **Outbox age is the primary SLI.** A stalled relay is invisible from the API — payments keep
   returning `201` while notifications silently stop. Age beats depth, because a deep but
-  draining backlog is healthy and a shallow static one is not.
+  draining backlog is healthy and a shallow static one is not. The gauge holds the oldest row's
+  *timestamp* and computes the age at scrape time, so it keeps growing even if the relay stops
+  updating it; `relay_last_poll_age` covers a relay that died while the backlog was empty.
 - **Every outcome counter is registered at zero on startup.** A counter that has never been
   incremented is absent from a Prometheus scrape entirely, so an alert filtering on a rare
   outcome would have no series to evaluate until the first occurrence — exactly when it needs

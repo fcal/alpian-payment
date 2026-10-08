@@ -6,8 +6,10 @@ import com.alpian.payment.domain.Payment;
 import com.alpian.payment.domain.PaymentId;
 import com.alpian.payment.domain.PaymentOutcome;
 import com.alpian.payment.domain.PaymentResult;
+import com.alpian.payment.outbox.PaymentEvents;
 import com.alpian.payment.repository.AccountRepository;
 import com.alpian.payment.repository.DebitResult;
+import com.alpian.payment.repository.OutboxRepository;
 import com.alpian.payment.repository.PaymentRepository;
 import java.time.Clock;
 import java.util.Optional;
@@ -46,11 +48,17 @@ public class PaymentExecutor {
 
   private final AccountRepository accounts;
   private final PaymentRepository payments;
+  private final OutboxRepository outbox;
   private final Clock clock;
 
-  public PaymentExecutor(AccountRepository accounts, PaymentRepository payments, Clock clock) {
+  public PaymentExecutor(
+      AccountRepository accounts,
+      PaymentRepository payments,
+      OutboxRepository outbox,
+      Clock clock) {
     this.accounts = accounts;
     this.payments = payments;
+    this.outbox = outbox;
     this.clock = clock;
   }
 
@@ -120,7 +128,8 @@ public class PaymentExecutor {
             id,
             applied.newBalance());
         yield new PaymentResult.Completed(
-            payments.append(
+            journal(
+                request,
                 Payment.completed(
                     paymentId,
                     id,
@@ -141,7 +150,8 @@ public class PaymentExecutor {
         // key has a stored outcome. The reason quotes no figures: a message is a poor channel for
         // balance disclosure.
         yield new PaymentResult.Declined(
-            payments.append(
+            journal(
+                request,
                 Payment.failed(
                     paymentId,
                     id,
@@ -166,6 +176,23 @@ public class PaymentExecutor {
                   .formatted(
                       request.amount().currencyCode(), mismatch.accountBalance().currencyCode()));
     };
+  }
+
+  /**
+   * Appends the payment to the journal and enqueues its event, both in the current transaction.
+   *
+   * <p>This is the transactional outbox. The event row commits with the debit and the journal entry
+   * or not at all, so there is no dual write: Kafka can never receive an event for a payment that
+   * rolled back, and a committed payment can never lose its event. Publication happens later, from
+   * the outbox, and touches nothing here — which is also why a Kafka outage cannot fail a payment.
+   *
+   * <p>Declined payments are enqueued too, so the payer is told about a decline as well as a
+   * success.
+   */
+  private Payment journal(PaymentRequest request, Payment payment) {
+    Payment appended = payments.append(payment);
+    outbox.enqueue(PaymentEvents.toOutboxMessage(appended, request.userId()));
+    return appended;
   }
 
   /**

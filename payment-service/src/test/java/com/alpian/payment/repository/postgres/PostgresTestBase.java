@@ -2,12 +2,20 @@ package com.alpian.payment.repository.postgres;
 
 import com.alpian.payment.config.JdbcConfiguration;
 import com.alpian.payment.config.PaymentProperties;
+import com.alpian.payment.observability.PaymentMetrics;
+import com.alpian.payment.service.PaymentExecutor;
+import com.alpian.payment.service.PaymentService;
+import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Clock;
 import java.time.Duration;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
+import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.interceptor.MatchAlwaysTransactionAttributeSource;
+import org.springframework.transaction.interceptor.TransactionInterceptor;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -48,6 +56,7 @@ public abstract class PostgresTestBase {
   protected TransactionTemplate transactions;
   protected PostgresAccountRepository accounts;
   protected PostgresPaymentRepository payments;
+  protected PostgresOutboxRepository outbox;
 
   @BeforeEach
   void prepareDatabase() {
@@ -65,6 +74,26 @@ public abstract class PostgresTestBase {
     this.transactions = new TransactionTemplate(new DataSourceTransactionManager(ds));
     this.accounts = new PostgresAccountRepository(jdbc, new PaymentProperties(LOCK_TIMEOUT));
     this.payments = new PostgresPaymentRepository(jdbc);
+    this.outbox = new PostgresOutboxRepository(jdbc);
+  }
+
+  /**
+   * A {@link PaymentService} over the real repositories, with {@link PaymentExecutor} wrapped in a
+   * genuine transactional proxy.
+   *
+   * <p>Built by hand rather than by the Spring container, so the repository suites stay fast. A
+   * plain {@code new PaymentExecutor(...)} would leave {@code @Transactional} inert and the
+   * repositories' transaction guards would reject every call, so the proxy is not optional.
+   */
+  protected PaymentService paymentService(Clock clock, MeterRegistry registry) {
+    ProxyFactory factory = new ProxyFactory(new PaymentExecutor(accounts, payments, outbox, clock));
+    factory.setProxyTargetClass(true);
+    factory.addAdvice(
+        new TransactionInterceptor(
+            new DataSourceTransactionManager(dataSource),
+            new MatchAlwaysTransactionAttributeSource()));
+    return new PaymentService(
+        (PaymentExecutor) factory.getProxy(), payments, new PaymentMetrics(registry, clock));
   }
 
   /** Drops and reapplies the production migrations, so each test starts from a known schema. */
@@ -77,7 +106,7 @@ public abstract class PostgresTestBase {
         .migrate();
     // The seed migration inserts demo rows; tests create their own fixtures and assert on counts,
     // so those rows are removed rather than worked around.
-    jdbcFor(ds).sql("TRUNCATE payment, account, app_user CASCADE").update();
+    jdbcFor(ds).sql("TRUNCATE outbox, payment, account, app_user CASCADE").update();
   }
 
   private JdbcClient jdbcFor(DataSource ds) {

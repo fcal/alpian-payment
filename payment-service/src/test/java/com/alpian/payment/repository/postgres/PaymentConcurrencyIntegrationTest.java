@@ -11,8 +11,6 @@ import com.alpian.payment.domain.Payment;
 import com.alpian.payment.domain.PaymentResult;
 import com.alpian.payment.domain.PaymentStatus;
 import com.alpian.payment.domain.UserId;
-import com.alpian.payment.observability.PaymentMetrics;
-import com.alpian.payment.service.PaymentExecutor;
 import com.alpian.payment.service.PaymentRequest;
 import com.alpian.payment.service.PaymentService;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -30,9 +28,6 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.springframework.aop.framework.ProxyFactory;
-import org.springframework.transaction.interceptor.MatchAlwaysTransactionAttributeSource;
-import org.springframework.transaction.interceptor.TransactionInterceptor;
 
 /**
  * The authoritative concurrency suite: real PostgreSQL, real transactions, real row locks.
@@ -41,10 +36,8 @@ import org.springframework.transaction.interceptor.TransactionInterceptor;
  * adds no race of its own. These show that the mechanism actually prevents double spending, which
  * is the central claim of the whole exercise.
  *
- * <p>{@link PaymentExecutor} is wrapped in a transactional proxy built by hand rather than by the
- * Spring container. A plain {@code new PaymentExecutor(...)} would leave {@code @Transactional}
- * inert, and the repository's {@code requireTransaction} guard would reject every call — which is
- * the guard doing its job, but it means these tests must supply a genuine transaction boundary.
+ * <p>The service comes from {@link PostgresTestBase#paymentService}, which supplies the genuine
+ * transaction boundary these guarantees depend on.
  */
 class PaymentConcurrencyIntegrationTest extends PostgresTestBase {
 
@@ -62,22 +55,7 @@ class PaymentConcurrencyIntegrationTest extends PostgresTestBase {
     account = new AccountId(UUID.randomUUID());
     seedUser(owner);
 
-    service =
-        new PaymentService(
-            transactionalProxyFor(new PaymentExecutor(accounts, payments, Clock.systemUTC())),
-            payments,
-            new PaymentMetrics(new SimpleMeterRegistry()));
-  }
-
-  /** Applies the same transaction semantics the container would, around a hand-built instance. */
-  private PaymentExecutor transactionalProxyFor(PaymentExecutor target) {
-    ProxyFactory factory = new ProxyFactory(target);
-    factory.setProxyTargetClass(true);
-    factory.addAdvice(
-        new TransactionInterceptor(
-            new org.springframework.jdbc.datasource.DataSourceTransactionManager(dataSource),
-            new MatchAlwaysTransactionAttributeSource()));
-    return (PaymentExecutor) factory.getProxy();
+    service = paymentService(Clock.systemUTC(), new SimpleMeterRegistry());
   }
 
   @Test
@@ -95,6 +73,7 @@ class PaymentConcurrencyIntegrationTest extends PostgresTestBase {
     assertThat(declined).isEqualTo(THREADS - 10);
     assertThat(balance()).isEqualTo(Money.of("0.00", "CHF"));
     assertThat(payments.findByAccountId(account)).as("every attempt journalled").hasSize(THREADS);
+    assertThat(outboxRows()).as("one event per journalled attempt").isEqualTo(THREADS);
   }
 
   @Test
@@ -154,6 +133,11 @@ class PaymentConcurrencyIntegrationTest extends PostgresTestBase {
     assertThat(balance())
         .as("1000 less exactly one payment of 100")
         .isEqualTo(Money.of("900.00", "CHF"));
+
+    // And exactly one event. The losers' outbox rows were in the same transactions as their
+    // debits, so they rolled back together: a notification for a payment that did not happen is
+    // as impossible as the payment itself.
+    assertThat(outboxRows()).as("one event for one payment").isEqualTo(1);
   }
 
   @Test
@@ -267,6 +251,10 @@ class PaymentConcurrencyIntegrationTest extends PostgresTestBase {
   private void givenBalance(String amount) {
     accounts.save(
         new Account(account, owner, Money.of(amount, "CHF"), Instant.now(), Instant.now()));
+  }
+
+  private long outboxRows() {
+    return jdbc.sql("SELECT count(*) FROM outbox").query(Long.class).single();
   }
 
   private Money balance() {

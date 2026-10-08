@@ -3,12 +3,15 @@ package com.alpian.payment.observability;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.alpian.payment.domain.PaymentOutcome;
+import com.alpian.payment.support.MutableClock;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
+import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -17,13 +20,17 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 class PaymentMetricsTest {
 
+  private static final Instant START = Instant.parse("2026-10-08T09:00:00Z");
+
   private MeterRegistry registry;
+  private MutableClock clock;
   private PaymentMetrics metrics;
 
   @BeforeEach
   void setUp() {
     registry = new SimpleMeterRegistry();
-    metrics = new PaymentMetrics(registry);
+    clock = new MutableClock(START);
+    metrics = new PaymentMetrics(registry, clock);
   }
 
   @ParameterizedTest
@@ -115,19 +122,61 @@ class PaymentMetricsTest {
   @Test
   @DisplayName("backlog gauges reflect the latest relay poll")
   void backlogGaugesTrackLatestValue() {
-    assertThat(registry.find("payment.outbox.pending").gauge().value()).isZero();
+    assertThat(gauge("payment.outbox.pending")).isZero();
 
-    metrics.updateOutboxBacklog(42, Duration.ofSeconds(90));
+    metrics.updateOutboxBacklog(42, Optional.of(START.minusSeconds(90)));
 
-    assertThat(registry.find("payment.outbox.pending").gauge().value()).isEqualTo(42);
-    assertThat(registry.find("payment.outbox.oldest.pending.age").gauge().value()).isEqualTo(90);
+    assertThat(gauge("payment.outbox.pending")).isEqualTo(42);
+    assertThat(gauge("payment.outbox.oldest.pending.age")).isEqualTo(90);
 
-    // Gauges are absolute, not cumulative: a drained backlog must read zero, otherwise an alert
-    // on depth would latch on permanently after one spike.
-    metrics.updateOutboxBacklog(0, Duration.ZERO);
+    // Gauges are absolute, not cumulative: a drained backlog must read zero, or an alert on depth
+    // would latch on permanently after one spike.
+    metrics.updateOutboxBacklog(0, Optional.empty());
 
-    assertThat(registry.find("payment.outbox.pending").gauge().value()).isZero();
-    assertThat(registry.find("payment.outbox.oldest.pending.age").gauge().value()).isZero();
+    assertThat(gauge("payment.outbox.pending")).isZero();
+    assertThat(gauge("payment.outbox.oldest.pending.age")).isZero();
+  }
+
+  @Test
+  @DisplayName("the oldest-pending age keeps growing when the relay stops updating it")
+  void oldestAgeGrowsWhileTheRelayIsStalled() {
+    // The reason the gauge holds a timestamp rather than an age. A stalled relay makes no further
+    // updates; were the age stored, it would freeze at 30s and the stalled-relay alert -- the
+    // highest-value alert in the service -- could never fire.
+    metrics.updateOutboxBacklog(5, Optional.of(START.minusSeconds(30)));
+
+    clock.advance(Duration.ofMinutes(10)); // no further updates arrive
+
+    assertThat(gauge("payment.outbox.oldest.pending.age")).isEqualTo(630);
+  }
+
+  @Test
+  @DisplayName("time since the last relay poll grows when polls stop, even with nothing pending")
+  void lastPollAgeCatchesARelayThatDiedOnAnEmptyBacklog() {
+    // The case the oldest-age gauge cannot cover: the relay's last observation was an empty
+    // backlog, so oldest-age reads zero forever while new rows pile up unseen.
+    metrics.updateOutboxBacklog(0, Optional.empty());
+    metrics.recordRelayPoll();
+
+    clock.advance(Duration.ofMinutes(5));
+
+    assertThat(gauge("payment.outbox.oldest.pending.age")).isZero();
+    assertThat(gauge("payment.outbox.relay.last.poll.age")).isEqualTo(300);
+
+    metrics.recordRelayPoll();
+    assertThat(gauge("payment.outbox.relay.last.poll.age")).isZero();
+  }
+
+  @Test
+  @DisplayName("a relay that never polls at all shows a growing age from startup")
+  void lastPollAgeStartsAtStartup() {
+    clock.advance(Duration.ofSeconds(45));
+
+    assertThat(gauge("payment.outbox.relay.last.poll.age")).isEqualTo(45);
+  }
+
+  private double gauge(String name) {
+    return registry.find(name).gauge().value();
   }
 
   private double counterFor(PaymentOutcome outcome) {

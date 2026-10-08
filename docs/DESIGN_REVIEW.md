@@ -511,6 +511,34 @@ parking, topic creation scripts.
 **Exit:** one payment ⇒ exactly one event. **Kafka-down test passes**: payment still succeeds,
 event delivered after recovery.
 
+**Findings during implementation.**
+
+1. **The service would not have started.** `@Scheduled(fixedDelayString =
+   "${payment.outbox.poll-interval}")` re-reads the property with its own parser, which accepts
+   milliseconds or ISO-8601 but not the `500ms` in `application.yaml` — so the relay bean failed to
+   initialise and took the application with it. Every other test disabled the relay, so only the
+   Spring end-to-end test saw it. The relay is now scheduled programmatically from the
+   already-bound `Duration`: one key had been read by two parsers with different rules, and now has
+   one.
+2. **Every outage would have been parked.** `KafkaTemplate` wraps producer failures in Spring's
+   `KafkaProducerException`, which is not a Kafka `RetriableException`, so classifying the exception
+   as received treated an unreachable broker as permanent and parked after five attempts. The cause
+   chain is now unwrapped first. Confirmed by reintroducing the bug: the never-parks test fails.
+3. **Retriable failures must never park.** The plan said "after N attempts, park"; applied to every
+   failure, a long outage would park the entire backlog and turn a self-healing incident into a
+   manual replay. Parking is now for non-retriable errors only, with a dedicated `parked_at` column
+   in migration V4 rather than an edit to the already-applied V2.
+4. **The backlog gauge froze when the relay stalled** — see §17.3.
+5. **Producer defaults are wrong for a producer inside a transaction.** `max.block.ms` defaults to
+   60s and `delivery.timeout.ms` to 120s, during which the relay holds outbox row locks. Both are
+   now a few seconds, below the relay's own send timeout, so an absent broker fails fast.
+
+The stage's exit criteria hold: one payment yields exactly one event; 32 concurrent requests
+sharing a key yield one payment and one event, the losers' outbox rows rolling back with their
+debits; with the broker unreachable the payment still completes, its event is retried with backoff
+and delivered on recovery; and two relays draining 200 events concurrently publish each exactly
+once.
+
 ### Stage 5 — Notification module
 Kafka Streams dedup topology with a bounded state store, EOS v2, punctuator-based purge, DLT,
 notification sink (logged; note where a real provider call would go).
@@ -878,6 +906,7 @@ JVM memory and GC, and Kafka client metrics.
 | `payment_lock_wait_seconds` | timer | — | Time waiting for the per-account row lock |
 | `payment_outbox_pending` | gauge | — | Rows awaiting publication |
 | `payment_outbox_oldest_pending_age_seconds` | gauge | — | Age of the oldest unpublished row |
+| `payment_outbox_relay_last_poll_age_seconds` | gauge | — | Time since the relay last completed a poll |
 | `payment_outbox_published_total` | counter | — | Rows published successfully |
 | `payment_outbox_publish_failures_total` | counter | — | Failed publication attempts |
 | `payment_outbox_parked_total` | counter | — | Rows parked after exhausting retries |
@@ -919,7 +948,14 @@ point in an incident where it is the only question worth answering.
 **Backlog gauges are fed by the relay, not queried per scrape.** A naive gauge would run
 `SELECT count(*)` on every scrape, adding database load proportional to the number of scrapers
 and the size of the table. Instead the relay — which is already querying the outbox every 500ms
-— refreshes two `AtomicLong` holders, and the gauges read those. The scrape costs nothing.
+— refreshes holders that the gauges read, so the scrape costs nothing.
+
+That design has a trap, found in Stage 4: a gauge fed by the relay freezes when the relay stalls,
+which is precisely the failure it exists to detect. The age gauge therefore holds the oldest row's
+*creation timestamp* and computes the age at scrape time, so it keeps growing without updates. It
+cannot cover a relay that died on an empty backlog — its last observation was "nothing pending" —
+so a second gauge, time since the last completed poll, does; it is not advanced when a poll fails,
+so a relay that keeps failing ages too.
 
 **Amounts are tagged by currency, never aggregated across them.** A single
 `payment_amount_sum` spanning CHF and EUR is a number with no meaning. Cardinality is safe
@@ -945,6 +981,7 @@ Roughly in order of value:
 | Signal | Condition | Why it matters |
 |---|---|---|
 | `payment_outbox_oldest_pending_age_seconds` | > 60s sustained | **The highest-value alert.** A stalled relay is invisible from the API: payments return `201` and notifications silently stop. Age beats depth — a deep but draining backlog is healthy, a shallow static one is not |
+| `payment_outbox_relay_last_poll_age_seconds` | > 30s | The relay is not running, or every poll is failing — including on an empty backlog, where the age gauge cannot see it |
 | `payment_outbox_parked_total` | any increase | A poison event needing human inspection |
 | `payment_attempts_total{outcome="lock_timeout"}` | rising rate | Contention on a hot account; capacity problem forming |
 | `payment_lock_wait_seconds` p99 | rising while execution flat | Contention, as distinct from database slowness |

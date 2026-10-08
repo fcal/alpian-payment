@@ -24,7 +24,10 @@ import org.testcontainers.containers.PostgreSQLContainer;
  * #givenAccount} rather than relying on the seeded demo rows. Seed data mutated by one class would
  * otherwise make another's assertions depend on execution order.
  */
-@SpringBootTest(properties = "spring.docker.compose.enabled=false")
+// The relay is off: these tests have no broker, and with it on, payments made here would be
+// published to whatever Kafka listens on localhost:9092 -- on a developer machine, the dev stack.
+@SpringBootTest(
+    properties = {"spring.docker.compose.enabled=false", "payment.outbox.relay-enabled=false"})
 public abstract class ApplicationTestBase {
 
   @ServiceConnection

@@ -11,6 +11,7 @@ import com.alpian.payment.domain.PaymentResult;
 import com.alpian.payment.domain.UserId;
 import com.alpian.payment.observability.PaymentMetrics;
 import com.alpian.payment.repository.inmemory.InMemoryAccountRepository;
+import com.alpian.payment.repository.inmemory.InMemoryOutboxRepository;
 import com.alpian.payment.repository.inmemory.InMemoryPaymentRepository;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
@@ -53,6 +54,7 @@ class PaymentServiceConcurrencyTest {
 
   private InMemoryAccountRepository accounts;
   private InMemoryPaymentRepository payments;
+  private InMemoryOutboxRepository outbox;
   private PaymentService service;
 
   @BeforeEach
@@ -60,11 +62,12 @@ class PaymentServiceConcurrencyTest {
     Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
     accounts = new InMemoryAccountRepository(clock);
     payments = new InMemoryPaymentRepository();
+    outbox = new InMemoryOutboxRepository();
     service =
         new PaymentService(
-            new PaymentExecutor(accounts, payments, clock),
+            new PaymentExecutor(accounts, payments, outbox, clock),
             payments,
-            new PaymentMetrics(new SimpleMeterRegistry()));
+            new PaymentMetrics(new SimpleMeterRegistry(), clock));
   }
 
   @Test

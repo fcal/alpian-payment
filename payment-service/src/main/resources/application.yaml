@@ -44,6 +44,15 @@ spring:
       properties:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
+        # The client defaults suit a producer that can wait. This one runs inside a database
+        # transaction holding outbox row locks, so a missing broker must surface as a failure in
+        # seconds, not minutes: max.block.ms (60s by default) bounds a send() blocked on broker
+        # metadata, delivery.timeout.ms (120s) bounds the wait for an acknowledgement. Must stay
+        # below payment.outbox.send-timeout so the client gives up before the relay does.
+        max.block.ms: 5000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
+        linger.ms: 5
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
 
@@ -53,10 +62,16 @@ payment:
   # 503 with Retry-After rather than hanging the client.
   lock-timeout: 3s
   outbox:
+    relay-enabled: true
+    topic: payment-events
     poll-interval: 500ms
     batch-size: 100
-    max-attempts: 10
-    topic: payment-events
+    # Attempts before a message failing with a NON-retriable error is parked. Retriable failures
+    # (an unreachable broker) are retried indefinitely and never park.
+    max-attempts: 5
+    initial-backoff: 1s
+    max-backoff: 1m
+    send-timeout: 15s
 
 server:
   error:

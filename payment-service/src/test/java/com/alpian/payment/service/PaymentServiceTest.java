@@ -14,6 +14,7 @@ import com.alpian.payment.domain.PaymentStatus;
 import com.alpian.payment.domain.UserId;
 import com.alpian.payment.observability.PaymentMetrics;
 import com.alpian.payment.repository.inmemory.InMemoryAccountRepository;
+import com.alpian.payment.repository.inmemory.InMemoryOutboxRepository;
 import com.alpian.payment.repository.inmemory.InMemoryPaymentRepository;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -45,6 +46,7 @@ class PaymentServiceTest {
 
   private InMemoryAccountRepository accounts;
   private InMemoryPaymentRepository payments;
+  private InMemoryOutboxRepository outbox;
   private MeterRegistry registry;
   private PaymentService service;
 
@@ -53,6 +55,7 @@ class PaymentServiceTest {
     Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
     accounts = new InMemoryAccountRepository(clock);
     payments = new InMemoryPaymentRepository();
+    outbox = new InMemoryOutboxRepository();
     registry = new SimpleMeterRegistry();
     // PaymentExecutor is constructed directly, so its @Transactional is inert here. That is
     // correct for these tests: the in-memory repositories have no transaction to join, and the
@@ -60,7 +63,9 @@ class PaymentServiceTest {
     // asserted against real PostgreSQL in the repository integration tests.
     service =
         new PaymentService(
-            new PaymentExecutor(accounts, payments, clock), payments, new PaymentMetrics(registry));
+            new PaymentExecutor(accounts, payments, outbox, clock),
+            payments,
+            new PaymentMetrics(registry, clock));
   }
 
   private void givenAccount(String balance, String currency) {
@@ -79,6 +84,53 @@ class PaymentServiceTest {
 
   private double attempts(PaymentOutcome outcome) {
     return registry.find("payment.attempts").tag("outcome", outcome.tagValue()).counter().count();
+  }
+
+  @Nested
+  class Events {
+
+    @Test
+    @DisplayName("a completed payment enqueues exactly one event for it")
+    void enqueuesAnEventForACompletedPayment() {
+      givenAccount("1000.00", "CHF");
+
+      PaymentResult result = service.submit(request("250.50", "CHF", "key-1"));
+
+      assertThat(outbox.enqueued()).hasSize(1);
+      assertThat(outbox.enqueued().get(0).aggregateId())
+          .isEqualTo(result.journalEntry().orElseThrow().id().value());
+    }
+
+    @Test
+    @DisplayName("a declined payment enqueues an event too, so the payer hears about it")
+    void enqueuesAnEventForADecline() {
+      givenAccount("10.00", "CHF");
+
+      service.submit(request("50.00", "CHF", "key-1"));
+
+      assertThat(outbox.enqueued()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("a replay enqueues nothing: the original attempt already has its event")
+    void replaysEnqueueNothing() {
+      givenAccount("1000.00", "CHF");
+      service.submit(request("100.00", "CHF", "key-1"));
+
+      service.submit(request("100.00", "CHF", "key-1"));
+
+      assertThat(outbox.enqueued()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("a rejection enqueues nothing: there is no payment to notify about")
+    void rejectionsEnqueueNothing() {
+      givenAccount("1000.00", "CHF");
+
+      service.submit(request("10.00", "EUR", "key-1"));
+
+      assertThat(outbox.enqueued()).isEmpty();
+    }
   }
 
   @Nested
