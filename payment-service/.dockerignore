@@ -1,0 +1,5 @@
+# Only the boot jar is needed; everything else would just slow the build context. The Dockerfile
+# itself stays included because docker-java (used by Testcontainers) refuses to build otherwise.
+*
+!Dockerfile
+!build/libs/payment-service.jar

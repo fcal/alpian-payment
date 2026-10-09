@@ -4,14 +4,12 @@ plugins {
     alias(libs.plugins.springDependencyManagement)
 }
 
-// Component tests live in their own source set: they drive the fully assembled service
-// against real Postgres and Kafka containers, so they are slower than unit tests and must
-// be runnable (and skippable) independently.
+// Component tests live in their own source set. They are black-box: both services run as the
+// Docker images their Dockerfiles build, against real Postgres and Kafka containers, and the
+// tests reach them only over HTTP, Kafka and SQL. The source set therefore deliberately does not
+// see the main classes -- only the shared event contract in :proto.
 sourceSets {
-    component {
-        compileClasspath += sourceSets.main.output
-        runtimeClasspath += sourceSets.main.output
-    }
+    component {}
 }
 
 configurations {
@@ -46,14 +44,34 @@ dependencies {
     testImplementation libs.testcontainers.postgresql
     testImplementation libs.testcontainers.kafka
     testImplementation libs.awaitility
+
+    componentImplementation project(':proto')
+    componentImplementation 'com.fasterxml.jackson.core:jackson-databind'
+    componentImplementation 'org.apache.kafka:kafka-clients'
+    componentRuntimeOnly libs.postgresql
 }
 
 tasks.register('componentTest', Test) {
-    description = 'Runs component tests against real Postgres and Kafka containers.'
+    description = 'Runs both services as Docker images against real Postgres and Kafka.'
     group = 'verification'
     testClassesDirs = sourceSets.component.output.classesDirs
     classpath = sourceSets.component.runtimeClasspath
     shouldRunAfter tasks.named('test')
+
+    // The images are built from these jars and Dockerfiles, so a change to any of them -- not
+    // only to the code -- reruns the tests.
+    def serviceJars = [tasks.named('bootJar'), project(':notification-service').tasks.named('bootJar')]
+    dependsOn serviceJars
+    inputs.files(serviceJars)
+    [projectDir, project(':notification-service').projectDir].each { dir ->
+        inputs.files(new File(dir, 'Dockerfile'), new File(dir, '.dockerignore'))
+    }
+    inputs.file(rootProject.file('docker/kafka/create-topics.sh'))
+
+    systemProperty 'component.payment-service.dir', projectDir.absolutePath
+    systemProperty 'component.notification-service.dir',
+            project(':notification-service').projectDir.absolutePath
+    systemProperty 'component.create-topics', rootProject.file('docker/kafka/create-topics.sh').absolutePath
 }
 
 tasks.named('check') {

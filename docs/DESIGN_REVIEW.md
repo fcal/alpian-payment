@@ -615,6 +615,52 @@ Separate `src/component` source set (mirroring the reference repo) spinning paym
 notification-service + Postgres + Kafka via Testcontainers.
 **Exit:** `POST` → DB row → Kafka event → notification asserted end to end.
 
+**How.** Both services run as the Docker images their `Dockerfile`s build, rather than as Spring
+contexts inside the test JVM. In-process would have been faster, but both modules put an
+`application.yaml` at the classpath root, so only one would load, and the result would not be
+what is deployed. The source set no longer sees the main classes, which keeps the tests
+black-box: they reach the system only over HTTP, Kafka and SQL, plus the delivery line the
+notification sender logs, which is the side effect a real provider call would replace. Topics
+come from the compose stack's own `create-topics.sh`, so drift between that script and the
+services fails here.
+
+**Findings during implementation.**
+
+1. **The notification image could not run Kafka Streams.** It was built on
+   `eclipse-temurin:21-jre-alpine`. RocksDB, which backs the deduplication store, ships a native
+   library linked against glibc's `libstdc++`. On Alpine's musl it fails to load, every stream
+   thread dies on its first store access, and the client goes to `ERROR`. Nothing earlier could
+   have caught it: the unit, `TopologyTestDriver` and broker tests all run on the host JVM. Both
+   images now use the glibc-based `eclipse-temurin:21-jre`. This one finding is the argument for
+   testing the image rather than the jar.
+2. **"Ready" did not mean "processing".** The notification service reported ready before Streams
+   had started, so the broken image above passed every startup check, and the failure surfaced
+   only as delivery timeouts in unrelated tests. Two changes follow. The Streams health indicator
+   is now in the readiness group as well as liveness, so a rolling deployment of an image that
+   cannot run halts at the first instance rather than replacing healthy ones. And the component
+   stack waits for Streams to report `RUNNING` before any test starts. Reintroducing the Alpine
+   image now fails at startup with the health response: `"kafkaStreams":{"status":"DOWN",
+   "details":{"state":"ERROR"}}`.
+3. **The catalog's Testcontainers version was not the one in use.** Spring Boot's dependency
+   management silently resolved Testcontainers to 1.19.8 over the catalog's 1.20.2, and the
+   cross-container Kafka listener this stage needs only exists in 1.20. Overriding Boot's
+   `testcontainers.version` property makes the catalog authoritative again. This is the same
+   failure mode as the Stage 5 Kafka Streams pin, in the opposite direction.
+4. **The tests did not rerun when an image changed.** `componentTest` declared the jars as inputs
+   but not the `Dockerfile`s, so Gradle reported the task up to date after a base-image change. It
+   surfaced when a mutation check reported success in one second. The Dockerfiles,
+   `.dockerignore` files and topic script are now declared inputs.
+5. **An outage is simulated by pausing the broker, not stopping it.** Stopping a container
+   releases its mapped port and network identity, so it cannot come back at the same address.
+   Pausing keeps both, and connections hang rather than being refused. That is the harder case,
+   because clients block on timeouts instead of failing fast, and it is what a network partition
+   looks like. The test asserts the payment returns in under two seconds while the relay records
+   failed attempts and parks nothing.
+
+Testcontainers' HTTP wait strategy with a response-body predicate never matched, although the
+endpoint returned the expected body when probed by hand. Rather than depend on it, the stack
+polls the liveness endpoint itself and fails with the last response it saw.
+
 ### Stage 7 — Polish
 README design-decision write-up (locking strategy, ORM vs SQL, outbox vs CDC, key design, why
 Streams, what HA requires, explicit security exclusions), GitHub Actions CI, Actuator, final

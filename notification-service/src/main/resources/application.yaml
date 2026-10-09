@@ -73,6 +73,11 @@ management:
           # the instance replaced. A broker outage does not trip this: the client stays RUNNING and
           # retries.
           include: livenessState,kafkaStreams
+        readiness:
+          # Also in readiness, so a rolling deployment of an image whose topology cannot run halts
+          # at the first instance instead of replacing healthy ones. Without it the application
+          # reports ready before Streams has processed anything.
+          include: readinessState,kafkaStreams
 
 server:
   port: 8081

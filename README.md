@@ -20,8 +20,8 @@ Implemented in stages; each stage is independently buildable and green.
 | 3 | REST API, error contract, OpenAPI | ✅ Done |
 | 4 | Outbox relay → Kafka | ✅ Done |
 | 5 | Notification service (Kafka Streams deduplication) | ✅ Done |
-| 6 | End-to-end component tests | ⏳ Next |
-| 7 | Documentation and CI | — |
+| 6 | End-to-end component tests | ✅ Done |
+| 7 | Documentation and CI | ⏳ Next |
 
 ## Modules
 
@@ -71,9 +71,36 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
 ./gradlew spotlessApply  # apply google-java-format
 ```
 
-Component tests live in a dedicated `src/component` source set in `payment-service`: they
-drive the assembled service against real PostgreSQL and Kafka containers via Testcontainers,
-so they are slower than unit tests and are kept separately runnable.
+Component tests live in a dedicated `src/component` source set in `payment-service`. They run
+the whole system as it would be deployed — both services as the Docker images their
+`Dockerfile`s build, PostgreSQL, Kafka, and the topics created by the same
+`docker/kafka/create-topics.sh` the compose stack uses — and reach it only over HTTP, Kafka and
+SQL. The source set deliberately cannot see the services' classes. Each test follows a payment
+through every hop to the notification service's delivery log:
+
+| Scenario | What it proves |
+|---|---|
+| Happy path | `201` → journal and balance → outbox published → event on `payment-events` → notification → delivery |
+| Retried request | Same `Idempotency-Key` twice: one debit, one event, one notification |
+| Declined payment | `409 insufficient_funds`, balance unchanged, the payer told why |
+| 20 concurrent payments on CHF 1000 | Exactly 10 succeed, the balance lands on 0.00, every attempt is notified |
+| Kafka unreachable | The broker is paused mid-test: the payment still returns `201` in well under 2s, the relay retries without parking, and the notification arrives after recovery |
+
+They take about a minute once the images are cached, and rerun whenever either service's code,
+its `Dockerfile` or the topic script changes.
+
+### Docker images
+
+Each service has a `Dockerfile` that packages its boot jar on a JRE, running as a non-root user:
+
+```bash
+./gradlew :payment-service:bootJar :notification-service:bootJar
+docker build -t payment-service payment-service
+docker build -t notification-service notification-service
+```
+
+Both are configured entirely through the environment: `POSTGRES_URL`, `POSTGRES_USER` and
+`POSTGRES_PASSWORD` for the payment service, `SPRING_KAFKA_BOOTSTRAP_SERVERS` for both.
 
 ## Design summary
 

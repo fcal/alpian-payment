@@ -39,6 +39,18 @@ subprojects {
             systemProperty 'spring.docker.compose.file',
                     rootProject.file('compose.yaml').absolutePath
         }
+        // A version-free name, so each module's Dockerfile can COPY it without tracking the
+        // project version.
+        tasks.named('bootJar') {
+            archiveFileName = "${project.name}.jar"
+        }
+    }
+
+    // Spring Boot's dependency management pins Testcontainers to the version Boot was released
+    // with, silently overriding the catalog (1.20.2 resolved as 1.19.8). Overriding Boot's
+    // version property makes the catalog the single source of truth again.
+    plugins.withId('io.spring.dependency-management') {
+        ext['testcontainers.version'] = libs.versions.testcontainers.get()
     }
 
     spotless {
