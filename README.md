@@ -19,8 +19,8 @@ Implemented in stages; each stage is independently buildable and green.
 | 2 | PostgreSQL implementation, row locking, concurrency tests | ✅ Done |
 | 3 | REST API, error contract, OpenAPI | ✅ Done |
 | 4 | Outbox relay → Kafka | ✅ Done |
-| 5 | Notification service (Kafka Streams deduplication) | ⏳ Next |
-| 6 | End-to-end component tests | — |
+| 5 | Notification service (Kafka Streams deduplication) | ✅ Done |
+| 6 | End-to-end component tests | ⏳ Next |
 | 7 | Documentation and CI | — |
 
 ## Modules
@@ -29,14 +29,15 @@ Implemented in stages; each stage is independently buildable and green.
 |---|---|
 | `proto` | Protobuf definitions of the Kafka event contract, shared by both services |
 | `payment-service` | REST API, payment execution, transaction journal, outbox relay |
-| `notification-service` | Kafka Streams application: deduplicates payment events, notifies the sender |
+| `notification-service` | Kafka Streams deduplication of payment events, and delivery of the resulting notifications |
 
 ## Running locally
 
 Requires Docker and a JDK 21 toolchain (Gradle provisions the toolchain if absent).
 
 ```bash
-./gradlew :payment-service:bootRun
+./gradlew :payment-service:bootRun        # REST API on :8080
+./gradlew :notification-service:bootRun   # notifications, actuator on :8081
 ```
 
 `spring-boot-docker-compose` starts the [`compose.yaml`](compose.yaml) stack — PostgreSQL and
@@ -101,9 +102,11 @@ while Kafka is down**, and the relay catches up on recovery.
 
 **Delivery is at-least-once, so the consumer deduplicates.** The notification service is a
 Kafka Streams application keeping already-notified payment ids in a state store, with
-`exactly_once_v2` making the store update and the output record commit together. Note the
-precise claim: this makes notification *effectively* once; the final side effect of delivering
-a message to a person is at-least-once in any system.
+`exactly_once_v2` making the store update and the output record commit together. The message
+itself is sent by a separate `read_committed` listener, not from inside the topology, because
+Streams re-runs an aborted transaction and would repeat any side effect in it. Note the precise
+claim: this makes notification *effectively* once; the final side effect of delivering a
+message to a person is at-least-once in any system.
 
 **Events are keyed by account id, not payment id.** That keeps an account's events on one
 partition and therefore ordered, and co-partitions them with the deduplication store. Topics
@@ -232,6 +235,44 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --property print.key=true --property print.headers=true
 ```
 
+## Notifications
+
+The notification service turns each payment event into one message to the payer, however many
+times the event is delivered:
+
+```
+payment-events ──▶ Kafka Streams: deduplicate ──▶ notification-events ──▶ delivery listener ──▶ provider
+                          │                                                     │
+                          └──▶ payment-events-dlt                               └──▶ notification-events-dlt
+```
+
+**Deduplication.** A state store remembers every payment id already notified; a redelivered
+event finds its id there and is dropped. Under `exactly_once_v2` the store write, the emitted
+notification and the input offset commit in one transaction, so a crash cannot leave a
+notification sent with its id unrecorded. The store is backed by a changelog topic, so it
+survives losing an instance's disk, and it is bounded: a punctuator purges ids older than 8
+days, longer than the input topic's 7-day retention, so no copy of an event can outlive its id.
+
+The store is per partition, which is correct only because every copy of a payment's event is
+keyed by the same account id and so lands on the same partition. An event keyed otherwise is
+dead-lettered rather than checked against the wrong store.
+
+**Delivery.** A listener reads `notification-events` with `read_committed`, so it sees only
+notifications from committed transactions, and hands each to a `NotificationSender`. Here the
+sender logs the message; it is where an email or push provider would be called, with the payment
+id as the provider's idempotency key, since a crash between sending and committing the offset
+sends again. Failed deliveries are retried with exponential backoff, then dead-lettered.
+
+**Dead letters.** An event that cannot be notified — undecodable, missing a field, an unknown
+status, or wrongly keyed — goes to `payment-events-dlt` with its original bytes and headers,
+plus `dlt-reason`, `dlt-error` and its original topic, partition and offset. A notification
+that fails every delivery attempt goes to `notification-events-dlt`. Neither blocks the
+partition behind it.
+
+To watch it work, run both services, submit a payment, and look for the `Notifying user` log
+line in the notification service. `scripts/tail-events.sh -t notification-events` decodes the
+deduplicated stream.
+
 ## High availability
 
 This repository runs a development topology: one service instance, one PostgreSQL container,
@@ -270,6 +311,7 @@ directly:
 
 ```bash
 curl -s localhost:8080/actuator/prometheus | grep '^payment_'
+curl -s localhost:8081/actuator/prometheus | grep '^notification_'
 ```
 
 Alongside the Spring Boot defaults (HTTP server timings, HikariCP pool state, JVM, Kafka
@@ -287,6 +329,11 @@ client), the application registers:
 | `payment_outbox_published_total` | counter | Rows published successfully |
 | `payment_outbox_publish_failures_total` | counter | Failed publication attempts |
 | `payment_outbox_parked_total` | counter | Rows parked after exhausting retries |
+| `notification_events_total{outcome}` | counter | Payment events by what deduplication did: `notified`, `duplicate_suppressed`, `dead_lettered` |
+| `notification_deliveries_total{outcome}` | counter | Delivery attempts: `sent`, `failed`, `dead_lettered` |
+| `notification_deduplication_purged_total` | counter | Payment ids purged from the store after their retention |
+
+`duplicate_suppressed` is the direct, observable evidence that deduplication is doing its job.
 
 Three choices are worth calling out, since they are the ones that make the metrics usable
 rather than merely present:

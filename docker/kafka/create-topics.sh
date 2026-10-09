@@ -45,11 +45,19 @@ create_topic notification-events 3 \
   "cleanup.policy=delete" \
   "retention.ms=604800000"
 
-# Dead-letter topic for records the notification service cannot process (e.g. undeserializable
-# payloads). Longer retention: these need human inspection, so they must outlive the incident.
+# Dead-letter topics. Longer retention: these need human inspection, so they must outlive the
+# incident that produced them.
+#
+# Payment events the notification service cannot turn into a notification: undecodable, invalid,
+# or keyed by something other than their account id.
 create_topic payment-events-dlt 3 \
   "cleanup.policy=delete" \
   "retention.ms=2592000000"  # 30 days
+
+# Notifications whose delivery failed every retry.
+create_topic notification-events-dlt 3 \
+  "cleanup.policy=delete" \
+  "retention.ms=2592000000"
 
 echo "Topics present:"
 "${KAFKA_TOPICS}" --bootstrap-server "${BOOTSTRAP_SERVER}" --list

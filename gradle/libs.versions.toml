@@ -6,7 +6,6 @@ protobuf = "3.25.5"
 spotless = "6.25.0"
 googleJavaFormat = "1.22.0"
 springdoc = "2.6.0"
-kafka = "3.8.0"
 testcontainers = "1.20.2"
 awaitility = "4.2.2"
 
@@ -20,8 +19,11 @@ postgresql = { module = "org.postgresql:postgresql", version = "42.7.4" }
 flyway-core = { module = "org.flywaydb:flyway-core" }
 flyway-postgresql = { module = "org.flywaydb:flyway-database-postgresql" }
 
-kafka-streams = { module = "org.apache.kafka:kafka-streams", version.ref = "kafka" }
-kafka-streams-test-utils = { module = "org.apache.kafka:kafka-streams-test-utils", version.ref = "kafka" }
+# Unversioned: Spring Boot manages the Kafka version, and kafka-streams must match the
+# kafka-clients that Spring Kafka is built against. Pinning Streams separately lets Boot pull
+# clients back underneath it, and Streams then fails at runtime with NoClassDefFoundError.
+kafka-streams = { module = "org.apache.kafka:kafka-streams" }
+kafka-streams-test-utils = { module = "org.apache.kafka:kafka-streams-test-utils" }
 
 testcontainers-bom = { module = "org.testcontainers:testcontainers-bom", version.ref = "testcontainers" }
 testcontainers-junit = { module = "org.testcontainers:junit-jupiter" }

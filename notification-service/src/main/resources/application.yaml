@@ -4,26 +4,55 @@ spring:
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
     streams:
       application-id: notification-service
       properties:
-        # The deduplication state store and the output record must commit together: without
-        # this, a crash between emitting a notification and updating the store would allow a
-        # duplicate notification after restart.
+        # The deduplication store update and the emitted notification commit atomically, together
+        # with the input offset. Without this, a crash between emitting a notification and
+        # recording its payment id would let the redelivered input be notified a second time.
         processing.guarantee: exactly_once_v2
-        # A record that cannot be deserialized must not wedge the topology; it is logged and
-        # skipped rather than retried forever.
-        default.deserialization.exception.handler: org.apache.kafka.streams.errors.LogAndContinueExceptionHandler
+        # One thread per input partition (payment-events has 3), so a single instance can own the
+        # whole topic; extra instances take partitions over in a rebalance.
         num.stream.threads: 3
+        # Under EOS, a crash restores the store from its changelog. A warm standby on another
+        # instance makes failover a hand-over rather than a full restore. Has no effect with a
+        # single instance, which is the local setup.
+        num.standby.replicas: 1
+        # Undecodable payloads never reach Streams' deserializer: values are read as raw bytes and
+        # decoded inside the processor, which dead-letters them with their original bytes. A
+        # LogAndContinueExceptionHandler would drop them with nothing but a log line.
+
+    # The delivery listener reads the deduplicated notifications.
+    consumer:
+      group-id: notification-dispatcher
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+      # A new consumer group starts from the oldest notification rather than the newest: starting
+      # at the end would silently skip every notification emitted before the first deployment.
+      auto-offset-reset: earliest
+      isolation-level: read_committed
+    # Used only to dead-letter notifications that could not be delivered.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+      acks: all
 
 notification:
   input-topic: payment-events
   output-topic: notification-events
-  dlt-topic: payment-events-dlt
-  # How long a payment id is remembered as already-notified. Must exceed the input topic's
-  # retention, otherwise a replayed record could be notified twice. Topic retention is 7
-  # days, so this is deliberately longer.
+  dead-letter-topic: payment-events-dlt
+  # How long a payment id is remembered as already notified. It must exceed the input topic's
+  # retention (7 days), otherwise a record replayed from the start of the topic could find its id
+  # already purged and be notified twice.
   deduplication-retention: 8d
+  # How often expired ids are purged from the store.
+  purge-interval: 1h
+  delivery:
+    dead-letter-topic: notification-events-dlt
+    max-attempts: 5
+    initial-backoff: 1s
+    max-backoff: 30s
 
 management:
   endpoints:
@@ -38,6 +67,12 @@ management:
       show-details: always
       probes:
         enabled: true
+      group:
+        liveness:
+          # A Streams client that has shut down does not restart by itself; failing liveness gets
+          # the instance replaced. A broker outage does not trip this: the client stays RUNNING and
+          # retries.
+          include: livenessState,kafkaStreams
 
 server:
   port: 8081

@@ -301,7 +301,8 @@ Protobuf is a good choice (compact, evolvable, consistent with the reference rep
   Map the timeout to `503`.
 - **Consumer-side DLT:** Spring Kafka `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`;
   in Streams, a `DeserializationExceptionHandler` (`LogAndContinue`) and a production exception
-  handler.
+  handler. *Revised in Stage 5: `LogAndContinue` drops the record, so decoding moved into the
+  processor, which dead-letters instead — see the Stage 5 findings.*
 - **Graceful degradation — the headline fault-tolerance test.** If Kafka is down, payments must
   still succeed. That is exactly what the outbox buys, and it is directly demonstrable: stop the
   Kafka container → POST a payment → assert `201` and an unpublished outbox row → restart Kafka →
@@ -544,6 +545,70 @@ Kafka Streams dedup topology with a bounded state store, EOS v2, punctuator-base
 notification sink (logged; note where a real provider call would go).
 **Exit:** duplicate input ⇒ single notification, proven via `TopologyTestDriver` and an embedded
 Kafka test.
+
+**Findings during implementation.**
+
+1. **The notification side effect must not run inside the topology.** The plan put the sink in
+   the Streams app. Under `exactly_once_v2` an aborted transaction is re-run from the last
+   commit, so a processor that sends an email sends it again, and no Kafka transaction can take
+   it back. That is the caveat §6 states, and putting the sink in a processor would have
+   reintroduced the exact duplicate deduplication exists to remove. The topology therefore stops at
+   `notification-events`, and a separate listener reading with `read_committed` performs the
+   delivery: retried with exponential backoff, then dead-lettered to a new
+   `notification-events-dlt` topic. The residual duplicate — a crash between sending and
+   committing the offset — is the one no broker guarantee removes, and is why the sender contract
+   asks for the payment id as the provider's idempotency key.
+2. **Deduplication silently depends on the record key.** The store is per partition, so a
+   duplicate is only caught if it reaches the same partition as the original — guaranteed by the
+   account-id key, and by nothing else. A producer keying by payment id, or not keying at all,
+   would scatter copies across partitions and get them notified more than once with no error
+   anywhere. Records whose key is not the payload's account id are now dead-lettered as
+   `key_mismatch`, turning a silent correctness loss into a visible one.
+3. **`LogAndContinueExceptionHandler` drops poison messages.** The planned configuration would
+   skip an undecodable record with a log line and nothing else. Values are now read as raw bytes
+   and decoded inside the processor, so an undecodable record reaches `payment-events-dlt` with
+   its original bytes and headers, plus the reason and its original coordinates, ready to be
+   inspected and replayed. Events that decode but cannot be notified — missing fields, an unknown
+   status from a newer producer — go the same way rather than being notified with a guessed
+   message.
+4. **The pinned Kafka Streams version failed at runtime.** The version catalog pinned
+   `kafka-streams` to 3.8.0, but Spring Boot's dependency management resolves `kafka-clients` to
+   3.7.1, the version Spring Kafka 3.2 is built against — Gradle reported no conflict, and the
+   first `TopologyTestDriver` failed with `NoClassDefFoundError`. Streams is now unversioned in the
+   catalog so Boot keeps both aligned. A 3.7 client against the 3.8 broker in `compose.yaml` is
+   fully supported.
+5. **Counters in a processor are not transactional.** They are incremented in the JVM, outside
+   the EOS transaction, so a batch re-processed after an abort is counted twice. The counters are
+   exact in steady state and may over-count around a crash or rebalance; the notifications
+   themselves are unaffected. Stated in the metrics class rather than left to be discovered.
+6. **A new deployment notifies the retained backlog.** A new consumer group starts from the
+   oldest offset, so the first start notifies every payment still on the topic — up to seven
+   days of them. Seen live during verification. This is deliberate: starting from the newest
+   offset instead would silently skip notifications whenever committed offsets are lost. A real
+   first rollout would either accept this or skip events older than a cut-off, which is a
+   product decision rather than a technical one.
+7. **A thread failure must be visible to the platform.** An exception escaping the processor is
+   a bug or an unwritable output, not a bad record — those are dead-lettered — so retrying in
+   place fails the same way. The uncaught-exception handler shuts the client down, and a health
+   indicator reporting the Streams state is part of the liveness group, so the instance gets
+   replaced. A broker outage does not trip it: the client stays `RUNNING` and retries.
+
+**Purging scales linearly with the store.** The punctuator scans the whole store hourly. Bounded
+by the retention, that is around eight million small entries at a million payments a day, spread
+across partitions. A windowed store, whose segments expire wholesale, would avoid the scan, at
+the cost of a lookup across segments on every event. The plain store reads more clearly for the
+exercise.
+
+**Tests.** `TopologyTestDriver` covers deduplication, retention at and past its boundary, and
+every dead-letter path, against a mocked wall clock. The planned embedded-Kafka test is instead
+a Testcontainers broker, as in the payment service, with the full Spring context. It proves that
+three copies of an event yield one committed notification and one delivery, that both
+dead-letter topics work without blocking the partition, and that deduplication survives a
+restart with the local state deleted. That last test only passes if the store is restored from
+its changelog: disabling the changelog makes it fail, and so does removing the deduplication
+check. Asserting that something happened *once* needs a point after which a second occurrence
+would already be visible. Each scenario therefore ends with a marker event on the same partition,
+and makes its assertions once the marker is delivered.
 
 ### Stage 6 — Component tests end to end
 Separate `src/component` source set (mirroring the reference repo) spinning payment-service +
@@ -915,11 +980,19 @@ The `outcome` tag takes its values from the `PaymentOutcome` enum: `completed`,
 `insufficient_funds`, `currency_mismatch`, `account_not_found`, `account_not_owned`,
 `idempotent_replay`, `idempotency_key_reused`, `lock_timeout`, `validation_failed`.
 
-Notification-service counters (`notification_events_total{outcome}`, with
-`duplicate_suppressed` as a value, and `notification_dlt_total`) arrive with the topology in
-Stage 5. The `duplicate_suppressed` counter is worth singling out: it is the direct, observable
-evidence that the deduplication requirement is working, rather than something inferred from the
-absence of complaints.
+The notification service registers its own, on `:8081`:
+
+| Metric | Type | Tags | Purpose |
+|---|---|---|---|
+| `notification_events_total` | counter | `outcome` | Payment events by what deduplication did with them |
+| `notification_deliveries_total` | counter | `outcome` | Delivery attempts by outcome |
+| `notification_deduplication_purged_total` | counter | — | Payment ids purged after their retention |
+
+Event outcomes are `notified`, `duplicate_suppressed` and `dead_lettered`; delivery outcomes are
+`sent`, `failed` and `dead_lettered`. Kafka Streams client metrics, consumer lag among them, are
+bound to Micrometer by Spring. `duplicate_suppressed` is worth singling out: it is the direct,
+observable evidence that the deduplication requirement is working, rather than something
+inferred from the absence of complaints.
 
 ### 17.3 Instrumentation decisions
 
@@ -988,6 +1061,8 @@ Roughly in order of value:
 | `payment_attempts_total{outcome="account_not_owned"}` | any sustained rate | Legitimate clients do not address other users' accounts; this is a client bug or probing |
 | `hikaricp_connections_pending` | > 0 sustained | Pool exhaustion, often downstream of lock contention (§16.2) |
 | Consumer group lag on `payment-events` | growing | Notification service falling behind |
+| `notification_events_total{outcome="dead_lettered"}` | any increase | An event no one was notified about; the record waits in `payment-events-dlt` |
+| `notification_deliveries_total{outcome="dead_lettered"}` | any increase | A notification that exhausted its retries; the provider may be down |
 
 ### 17.5 Logs and traces
 
