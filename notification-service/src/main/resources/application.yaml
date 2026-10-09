@@ -41,6 +41,15 @@ management:
     health:
       probes:
         enabled: true
+      group:
+        # Streams health (KafkaConfiguration) in both: a stopped client must get the instance
+        # replaced, and a rollout of an image that cannot process must halt at the first instance.
+        liveness:
+          include: livenessState,kafkaStreams
+          show-details: always
+        readiness:
+          include: readinessState,kafkaStreams
+          show-details: always
   metrics:
     tags:
       application: ${spring.application.name}

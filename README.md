@@ -116,7 +116,7 @@ Prometheus metrics at `/actuator/prometheus`, health probes at `/actuator/health
 |---|---|
 | `payment_attempts_total{outcome}` | Payment requests by outcome |
 | `payment_outbox_pending` | Events awaiting publication; growth means a stalled relay |
-| `notification_events_total{outcome}` | `notified`, `duplicate`, `skipped` (undecodable) |
+| `notification_events_total{outcome}` | `notified`, `duplicate`, `skipped` (undecodable or invalid) |
 | `notification_deliveries_dead_lettered_total` | Notifications that failed every retry |
 
 ## Out of scope

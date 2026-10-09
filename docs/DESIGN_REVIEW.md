@@ -111,8 +111,15 @@ between sending and committing the offset still sends again, so a real provider 
 payment id as its idempotency key. Notification is *effectively* once. The last hop to a human is
 at-least-once in any system.
 
-**Simplifications.** An undecodable event is logged and skipped rather than dead-lettered. The
-store is not purged, so it grows with the number of payments. Production would expire ids older
+**Bad events.** An event that cannot be decoded, or decodes but cannot be notified (missing or
+malformed amount, unknown currency, a status from a newer producer), is logged and skipped. It is
+never notified with a guessed message, and it never throws: an exception escaping the topology
+would fail the same record on every thread. Anything that still escapes (a bug, an unwritable
+output) shuts the Streams client down, and a health indicator in both the liveness and readiness
+groups reports it, so the instance is replaced instead of staying up and silently not
+processing. A broker outage keeps the client `RUNNING` while it retries, so it does not trip this.
+
+**Simplifications.** Skipped events are not dead-lettered. The store is not purged, so it grows with the number of payments. Production would expire ids older
 than the input topic's retention, with a punctuator or a windowed store.
 
 ## 7. Error handling

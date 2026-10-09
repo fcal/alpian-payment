@@ -34,6 +34,9 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.boot.actuate.health.Status;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -131,6 +134,10 @@ class NotificationServiceIntegrationTest {
   @Autowired RecordingSender sender;
   @Autowired StreamsBuilderFactoryBean streams;
 
+  @Autowired
+  @Qualifier("kafkaStreamsHealthIndicator")
+  HealthIndicator streamsHealth;
+
   @Test
   @DisplayName("an event received three times is delivered once")
   void duplicatesAreDeliveredOnce() {
@@ -159,6 +166,20 @@ class NotificationServiceIntegrationTest {
     ConsumerRecord<String, byte[]> dead = awaitDeadLetter(account);
     assertThat(NotificationEvent.parseFrom(dead.value()).getPaymentId())
         .isEqualTo(event.getPaymentId());
+  }
+
+  @Test
+  @DisplayName("an invalid event is skipped, and Streams keeps processing and reports healthy")
+  void invalidEventDoesNotStopProcessing() {
+    String account = UUID.randomUUID().toString();
+    PaymentEvent invalid = Events.completed(account).clearAmount().build();
+
+    send(invalid);
+    awaitDelivered(sendMarker(account));
+
+    assertThat(sender.attempts).doesNotContainKey(invalid.getPaymentId());
+    assertThat(streams.getKafkaStreams().state()).isEqualTo(KafkaStreams.State.RUNNING);
+    assertThat(streamsHealth.health().getStatus()).isEqualTo(Status.UP);
   }
 
   @Test

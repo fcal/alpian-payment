@@ -46,6 +46,12 @@ final class DeduplicationProcessor implements Processor<String, byte[], String, 
       count("skipped");
       return;
     }
+    String problem = Notifications.problem(event);
+    if (problem != null) {
+      log.warn("Skipping invalid event for payment {}: {}", event.getPaymentId(), problem);
+      count("skipped");
+      return;
+    }
 
     if (notified.get(event.getPaymentId()) != null) {
       log.info("Suppressed duplicate event for payment {}", event.getPaymentId());

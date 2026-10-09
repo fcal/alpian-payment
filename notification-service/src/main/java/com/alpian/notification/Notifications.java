@@ -29,6 +29,33 @@ final class Notifications {
         .build();
   }
 
+  /**
+   * Why {@code event} cannot be notified, or null if it can. Checked before notifying, so a bad
+   * event is skipped instead of throwing inside the topology and stopping every stream thread.
+   */
+  static String problem(PaymentEvent event) {
+    if (event.getUserId().isEmpty()) {
+      return "user_id is missing";
+    }
+    if (!event.hasAmount()) {
+      return "amount is missing";
+    }
+    try {
+      if (new BigDecimal(event.getAmount().getAmount()).signum() <= 0) {
+        return "amount is not positive";
+      }
+      Currency.getInstance(event.getAmount().getCurrency());
+    } catch (IllegalArgumentException e) { // also NumberFormatException
+      return "amount is malformed";
+    }
+    // Includes UNRECOGNIZED, a status from a newer producer: never notify with a guessed message.
+    if (event.getStatus() != PaymentStatus.PAYMENT_STATUS_COMPLETED
+        && event.getStatus() != PaymentStatus.PAYMENT_STATUS_FAILED) {
+      return "unsupported status " + event.getStatus();
+    }
+    return null;
+  }
+
   static String message(PaymentEvent event) {
     String payment =
         "Your payment of "

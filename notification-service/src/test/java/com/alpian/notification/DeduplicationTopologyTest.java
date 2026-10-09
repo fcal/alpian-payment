@@ -2,8 +2,10 @@ package com.alpian.notification;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.alpian.payment.events.v1.Money;
 import com.alpian.payment.events.v1.NotificationEvent;
 import com.alpian.payment.events.v1.PaymentEvent;
+import com.alpian.payment.events.v1.PaymentStatus;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -102,6 +104,26 @@ class DeduplicationTopologyTest {
 
     assertThat(output.readValuesToList()).hasSize(1);
     assertThat(metrics.counter("notification.events", "outcome", "skipped").count()).isEqualTo(2);
+  }
+
+  @Test
+  @DisplayName("an event that decodes but cannot be notified is skipped, not thrown")
+  void skipsInvalidEvents() {
+    pipe(Events.completed(ACCOUNT).clearAmount().build());
+    pipe(
+        Events.completed(ACCOUNT)
+            .setAmount(Money.newBuilder().setAmount("abc").setCurrency("CHF"))
+            .build());
+    pipe(
+        Events.completed(ACCOUNT)
+            .setAmount(Money.newBuilder().setAmount("1.00").setCurrency("XYZ"))
+            .build());
+    pipe(Events.completed(ACCOUNT).setStatus(PaymentStatus.PAYMENT_STATUS_UNSPECIFIED).build());
+    pipe(Events.completed(ACCOUNT).setStatusValue(99).build());
+    pipe(Events.completed(ACCOUNT).build());
+
+    assertThat(output.readValuesToList()).hasSize(1);
+    assertThat(metrics.counter("notification.events", "outcome", "skipped").count()).isEqualTo(5);
   }
 
   private void pipe(PaymentEvent event) {
