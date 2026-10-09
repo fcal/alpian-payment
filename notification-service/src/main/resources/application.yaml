@@ -4,52 +4,30 @@ spring:
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-
     streams:
       application-id: notification-service
       properties:
-        # The deduplication store update and the emitted notification commit atomically, together
-        # with the input offset. Without this, a crash between emitting a notification and
-        # recording its payment id would let the redelivered input be notified a second time.
+        # The dedup store, the emitted notification and the input offset commit atomically.
         processing.guarantee: exactly_once_v2
-        # One thread per input partition (payment-events has 3), so a single instance can own the
-        # whole topic; extra instances take partitions over in a rebalance.
         num.stream.threads: 3
-        # Under EOS, a crash restores the store from its changelog. A warm standby on another
-        # instance makes failover a hand-over rather than a full restore. Has no effect with a
-        # single instance, which is the local setup.
+        # A warm copy of the store on another instance makes failover fast.
         num.standby.replicas: 1
-        # Undecodable payloads never reach Streams' deserializer: values are read as raw bytes and
-        # decoded inside the processor, which dead-letters them with their original bytes. A
-        # LogAndContinueExceptionHandler would drop them with nothing but a log line.
-
-    # The delivery listener reads the deduplicated notifications.
+    # The delivery listener.
     consumer:
       group-id: notification-dispatcher
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
-      # A new consumer group starts from the oldest notification rather than the newest: starting
-      # at the end would silently skip every notification emitted before the first deployment.
       auto-offset-reset: earliest
+      # Only notifications from committed Streams transactions.
       isolation-level: read_committed
-    # Used only to dead-letter notifications that could not be delivered.
+    # Used to dead-letter undeliverable notifications.
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
       acks: all
 
 notification:
-  input-topic: payment-events
-  output-topic: notification-events
-  dead-letter-topic: payment-events-dlt
-  # How long a payment id is remembered as already notified. It must exceed the input topic's
-  # retention (7 days), otherwise a record replayed from the start of the topic could find its id
-  # already purged and be notified twice.
-  deduplication-retention: 8d
-  # How often expired ids are purged from the store.
-  purge-interval: 1h
   delivery:
-    dead-letter-topic: notification-events-dlt
     max-attempts: 5
     initial-backoff: 1s
     max-backoff: 30s
@@ -59,25 +37,13 @@ management:
     web:
       exposure:
         include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
   metrics:
     tags:
       application: ${spring.application.name}
-  endpoint:
-    health:
-      show-details: always
-      probes:
-        enabled: true
-      group:
-        liveness:
-          # A Streams client that has shut down does not restart by itself; failing liveness gets
-          # the instance replaced. A broker outage does not trip this: the client stays RUNNING and
-          # retries.
-          include: livenessState,kafkaStreams
-        readiness:
-          # Also in readiness, so a rolling deployment of an image whose topology cannot run halts
-          # at the first instance instead of replacing healthy ones. Without it the application
-          # reports ready before Streams has processed anything.
-          include: readinessState,kafkaStreams
 
 server:
   port: 8081

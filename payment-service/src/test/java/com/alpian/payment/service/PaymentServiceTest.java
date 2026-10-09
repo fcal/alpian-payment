@@ -2,406 +2,169 @@ package com.alpian.payment.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.alpian.payment.domain.Account;
-import com.alpian.payment.domain.AccountId;
-import com.alpian.payment.domain.Beneficiary;
-import com.alpian.payment.domain.IdempotencyKey;
-import com.alpian.payment.domain.Money;
-import com.alpian.payment.domain.Payment;
 import com.alpian.payment.domain.PaymentOutcome;
+import com.alpian.payment.domain.PaymentRequest;
 import com.alpian.payment.domain.PaymentResult;
 import com.alpian.payment.domain.PaymentStatus;
-import com.alpian.payment.domain.UserId;
-import com.alpian.payment.observability.PaymentMetrics;
-import com.alpian.payment.repository.inmemory.InMemoryAccountRepository;
-import com.alpian.payment.repository.inmemory.InMemoryOutboxRepository;
-import com.alpian.payment.repository.inmemory.InMemoryPaymentRepository;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import java.time.Clock;
-import java.time.Instant;
-import java.time.ZoneOffset;
+import com.alpian.payment.events.v1.PaymentEvent;
+import com.alpian.payment.support.ApplicationTestBase;
+import java.math.BigDecimal;
 import java.util.UUID;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 
-/**
- * Business-rule tests for {@link PaymentService}, against the in-memory repositories.
- *
- * <p>These establish that the service makes the right decisions given a repository that honours its
- * contract. They deliberately do <em>not</em> establish that the PostgreSQL implementation honours
- * it — no in-memory double can show that row locking or transaction rollback works. That is the job
- * of the stage 2 integration tests.
- */
-class PaymentServiceTest {
+/** Business rules of {@link PaymentService}, against a real database. */
+class PaymentServiceTest extends ApplicationTestBase {
 
-  private static final Instant NOW = Instant.parse("2026-10-06T12:00:00Z");
-  private static final UserId OWNER = new UserId(UUID.randomUUID());
-  private static final UserId SOMEONE_ELSE = new UserId(UUID.randomUUID());
-  private static final AccountId ACCOUNT = new AccountId(UUID.randomUUID());
-  private static final Beneficiary BENEFICIARY =
-      new Beneficiary("Acme GmbH", "CH9300762011623852957");
+  @Autowired PaymentService service;
 
-  private InMemoryAccountRepository accounts;
-  private InMemoryPaymentRepository payments;
-  private InMemoryOutboxRepository outbox;
-  private MeterRegistry registry;
-  private PaymentService service;
+  @Test
+  @DisplayName("a covered payment debits the account, is journalled and enqueues one event")
+  void completesAPayment() throws Exception {
+    Fixture f = givenAccount("1000.00", "CHF");
 
-  @BeforeEach
-  void setUp() {
-    Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
-    accounts = new InMemoryAccountRepository(clock);
-    payments = new InMemoryPaymentRepository();
-    outbox = new InMemoryOutboxRepository();
-    registry = new SimpleMeterRegistry();
-    // PaymentExecutor is constructed directly, so its @Transactional is inert here. That is
-    // correct for these tests: the in-memory repositories have no transaction to join, and the
-    // business rules under test do not depend on one. The invariants that DO depend on it are
-    // asserted against real PostgreSQL in the repository integration tests.
-    service =
-        new PaymentService(
-            new PaymentExecutor(accounts, payments, outbox, clock),
-            payments,
-            new PaymentMetrics(registry, clock));
+    PaymentResult result = service.submit(f.request("250.50", "key-1"));
+
+    assertThat(result.outcome()).isEqualTo(PaymentOutcome.COMPLETED);
+    assertThat(result.payment().beneficiaryIban()).isEqualTo("CH9300762011623852957");
+    assertThat(balance(f.account())).isEqualByComparingTo("749.50");
+    assertThat(service.payment(f.user(), f.account(), result.payment().id()))
+        .contains(result.payment());
+
+    byte[] payload =
+        jdbc.sql("SELECT payload FROM outbox WHERE payment_id = :id")
+            .param("id", result.payment().id())
+            .query(byte[].class)
+            .single();
+    PaymentEvent event = PaymentEvent.parseFrom(payload);
+    assertThat(event.getUserId()).isEqualTo(f.user().toString());
+    assertThat(event.getAmount().getAmount()).isEqualTo("250.5000");
   }
 
-  private void givenAccount(String balance, String currency) {
-    accounts.save(new Account(ACCOUNT, OWNER, Money.of(balance, currency), NOW, NOW));
+  @Test
+  @DisplayName(
+      "an uncovered payment is declined, journalled as FAILED and notified, funds untouched")
+  void declinesInsufficientFunds() {
+    Fixture f = givenAccount("100.00", "CHF");
+
+    PaymentResult result = service.submit(f.request("100.01", "key-1"));
+
+    assertThat(result.outcome()).isEqualTo(PaymentOutcome.INSUFFICIENT_FUNDS);
+    assertThat(result.payment().status()).isEqualTo(PaymentStatus.FAILED);
+    assertThat(result.payment().failureReason()).isEqualTo("Insufficient funds");
+    assertThat(balance(f.account())).isEqualByComparingTo("100.00");
+    assertThat(outboxRows(f.account())).isEqualTo(1);
   }
 
-  private PaymentRequest request(String amount, String currency, String idempotencyKey) {
-    return new PaymentRequest(
-        OWNER,
-        ACCOUNT,
-        new IdempotencyKey(idempotencyKey),
-        Money.of(amount, currency),
-        BENEFICIARY,
-        "invoice 42");
+  @Test
+  void permitsSpendingTheWholeBalance() {
+    Fixture f = givenAccount("100.00", "CHF");
+
+    assertThat(service.submit(f.request("100.00", "key-1")).outcome())
+        .isEqualTo(PaymentOutcome.COMPLETED);
+    assertThat(balance(f.account())).isZero();
   }
 
-  private double attempts(PaymentOutcome outcome) {
-    return registry.find("payment.attempts").tag("outcome", outcome.tagValue()).counter().count();
+  @Test
+  @DisplayName("a retry with the same key replays the original and does not debit again")
+  void replaysARetry() {
+    Fixture f = givenAccount("1000.00", "CHF");
+    PaymentResult original = service.submit(f.request("250.00", "same-key"));
+
+    // 250.0 is the same amount as 250.00: an equivalent request is still a replay.
+    PaymentResult replay = service.submit(f.request("250.0", "same-key"));
+
+    assertThat(replay.outcome()).isEqualTo(PaymentOutcome.REPLAYED);
+    assertThat(replay.payment().id()).isEqualTo(original.payment().id());
+    assertThat(balance(f.account())).isEqualByComparingTo("750.00");
+    assertThat(payments(f.account())).isEqualTo(1);
+    assertThat(outboxRows(f.account())).isEqualTo(1);
   }
 
-  @Nested
-  class Events {
+  @Test
+  @DisplayName("replaying the key of a declined payment returns the decline, even once funded")
+  void replaysADecline() {
+    Fixture f = givenAccount("10.00", "CHF");
+    service.submit(f.request("50.00", "same-key"));
+    jdbc.sql("UPDATE account SET balance = 1000 WHERE id = :id").param("id", f.account()).update();
 
-    @Test
-    @DisplayName("a completed payment enqueues exactly one event for it")
-    void enqueuesAnEventForACompletedPayment() {
-      givenAccount("1000.00", "CHF");
+    PaymentResult replay = service.submit(f.request("50.00", "same-key"));
 
-      PaymentResult result = service.submit(request("250.50", "CHF", "key-1"));
-
-      assertThat(outbox.enqueued()).hasSize(1);
-      assertThat(outbox.enqueued().get(0).aggregateId())
-          .isEqualTo(result.journalEntry().orElseThrow().id().value());
-    }
-
-    @Test
-    @DisplayName("a declined payment enqueues an event too, so the payer hears about it")
-    void enqueuesAnEventForADecline() {
-      givenAccount("10.00", "CHF");
-
-      service.submit(request("50.00", "CHF", "key-1"));
-
-      assertThat(outbox.enqueued()).hasSize(1);
-    }
-
-    @Test
-    @DisplayName("a replay enqueues nothing: the original attempt already has its event")
-    void replaysEnqueueNothing() {
-      givenAccount("1000.00", "CHF");
-      service.submit(request("100.00", "CHF", "key-1"));
-
-      service.submit(request("100.00", "CHF", "key-1"));
-
-      assertThat(outbox.enqueued()).hasSize(1);
-    }
-
-    @Test
-    @DisplayName("a rejection enqueues nothing: there is no payment to notify about")
-    void rejectionsEnqueueNothing() {
-      givenAccount("1000.00", "CHF");
-
-      service.submit(request("10.00", "EUR", "key-1"));
-
-      assertThat(outbox.enqueued()).isEmpty();
-    }
+    assertThat(replay.outcome()).isEqualTo(PaymentOutcome.REPLAYED);
+    assertThat(replay.payment().status()).isEqualTo(PaymentStatus.FAILED);
+    assertThat(balance(f.account())).isEqualByComparingTo("1000.00");
   }
 
-  @Nested
-  class HappyPath {
+  @Test
+  void refusesAKeyReusedForADifferentPayment() {
+    Fixture f = givenAccount("1000.00", "CHF");
+    service.submit(f.request("250.00", "same-key"));
 
-    @Test
-    void debitsTheAccountAndJournalsThePayment() {
-      givenAccount("1000.00", "CHF");
+    PaymentResult reused = service.submit(f.request("999.00", "same-key"));
 
-      PaymentResult result = service.submit(request("250.50", "CHF", "key-1"));
-
-      assertThat(result).isInstanceOf(PaymentResult.Completed.class);
-      assertThat(result.outcome()).isEqualTo(PaymentOutcome.COMPLETED);
-
-      Payment journalled = result.journalEntry().orElseThrow();
-      assertThat(journalled.status()).isEqualTo(PaymentStatus.COMPLETED);
-      assertThat(journalled.amount()).isEqualTo(Money.of("250.50", "CHF"));
-      assertThat(journalled.beneficiary()).isEqualTo(BENEFICIARY);
-      assertThat(journalled.referenceIfAny()).contains("invoice 42");
-      assertThat(journalled.failureReasonIfAny()).isEmpty();
-      assertThat(journalled.createdAt()).isEqualTo(NOW);
-
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("749.50", "CHF"));
-    }
-
-    @Test
-    @DisplayName("the whole balance may be spent, leaving exactly zero")
-    void permitsSpendingTheEntireBalance() {
-      givenAccount("100.00", "CHF");
-
-      assertThat(service.submit(request("100.00", "CHF", "key-1")))
-          .isInstanceOf(PaymentResult.Completed.class);
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance().isZero()).isTrue();
-    }
-
-    @Test
-    void recordsAmountAndOutcomeMetrics() {
-      givenAccount("1000.00", "CHF");
-
-      service.submit(request("250.50", "CHF", "key-1"));
-
-      assertThat(attempts(PaymentOutcome.COMPLETED)).isEqualTo(1);
-      var amount = registry.find("payment.amount").tag("currency", "CHF").summary();
-      assertThat(amount).isNotNull();
-      assertThat(amount.totalAmount()).isEqualTo(250.50);
-    }
+    assertThat(reused.outcome()).isEqualTo(PaymentOutcome.IDEMPOTENCY_KEY_REUSED);
+    assertThat(balance(f.account())).isEqualByComparingTo("750.00");
   }
 
-  @Nested
-  class BalanceCheck {
+  @Test
+  void rejectsAnUnknownAccount() {
+    Fixture f = new Fixture(UUID.randomUUID(), UUID.randomUUID());
 
-    @Test
-    @DisplayName("a payment beyond the balance is declined and journalled, with funds untouched")
-    void declinesAndJournalsInsufficientFunds() {
-      givenAccount("100.00", "CHF");
-
-      PaymentResult result = service.submit(request("100.01", "CHF", "key-1"));
-
-      assertThat(result).isInstanceOf(PaymentResult.Declined.class);
-      assertThat(result.outcome()).isEqualTo(PaymentOutcome.INSUFFICIENT_FUNDS);
-
-      Payment journalled = result.journalEntry().orElseThrow();
-      assertThat(journalled.status()).isEqualTo(PaymentStatus.FAILED);
-      assertThat(journalled.failureReasonIfAny()).contains("Insufficient funds");
-
-      // The decline must not move money, not even by a rounding step.
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("100.00", "CHF"));
-      assertThat(attempts(PaymentOutcome.INSUFFICIENT_FUNDS)).isEqualTo(1);
-    }
-
-    @Test
-    @DisplayName("a decline is recorded in the journal, so the attempt is accounted for")
-    void journalsDeclinedAttempts() {
-      givenAccount("10.00", "CHF");
-
-      service.submit(request("50.00", "CHF", "key-1"));
-
-      assertThat(payments.findByAccountId(ACCOUNT)).hasSize(1);
-    }
+    assertThat(service.submit(f.request("10.00", "key-1")).outcome())
+        .isEqualTo(PaymentOutcome.ACCOUNT_NOT_FOUND);
   }
 
-  @Nested
-  class Idempotency {
+  @Test
+  @DisplayName("another user's account is reported as not found, even with its idempotency key")
+  void rejectsAnotherUsersAccount() {
+    Fixture owner = givenAccount("1000.00", "CHF");
+    service.submit(owner.request("10.00", "owners-key"));
+    Fixture intruder = new Fixture(UUID.randomUUID(), owner.account());
 
-    @Test
-    @DisplayName("replaying a key returns the original outcome and does not debit again")
-    void replaysInsteadOfDebitingTwice() {
-      givenAccount("1000.00", "CHF");
-      PaymentRequest first = request("250.00", "CHF", "same-key");
+    PaymentResult result = service.submit(intruder.request("10.00", "owners-key"));
 
-      PaymentResult original = service.submit(first);
-      PaymentResult replay = service.submit(request("250.00", "CHF", "same-key"));
-
-      assertThat(replay).isInstanceOf(PaymentResult.Replayed.class);
-      assertThat(replay.outcome()).isEqualTo(PaymentOutcome.IDEMPOTENT_REPLAY);
-      // Same journal entry, not a new one with the same values.
-      assertThat(replay.journalEntry().orElseThrow().id())
-          .isEqualTo(original.journalEntry().orElseThrow().id());
-
-      // The essential assertion: one debit, not two.
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("750.00", "CHF"));
-      assertThat(payments.size()).isEqualTo(1);
-    }
-
-    @Test
-    @DisplayName("replaying the key of a declined payment returns that decline")
-    void replaysDeclinesToo() {
-      givenAccount("10.00", "CHF");
-      service.submit(request("50.00", "CHF", "same-key"));
-
-      // Funding the account does not revive the old key: a key identifies one attempt, and its
-      // recorded outcome is the answer. A client wanting to try again presents a new key.
-      accounts.save(new Account(ACCOUNT, OWNER, Money.of("1000.00", "CHF"), NOW, NOW));
-      PaymentResult replay = service.submit(request("50.00", "CHF", "same-key"));
-
-      assertThat(replay).isInstanceOf(PaymentResult.Replayed.class);
-      assertThat(replay.journalEntry().orElseThrow().status()).isEqualTo(PaymentStatus.FAILED);
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("1000.00", "CHF"));
-    }
-
-    @Test
-    @DisplayName("another user cannot read a payment by replaying its idempotency key")
-    void replayDoesNotBypassOwnership() {
-      // Regression: the replay lookup used to run before the ownership check. A second user who
-      // addressed someone else's account with a key that account had used would receive the
-      // stored payment -- beneficiary, amount, reference -- as a "replay".
-      givenAccount("1000.00", "CHF");
-      service.submit(request("250.00", "CHF", "owners-key"));
-
-      PaymentResult intruder =
-          service.submit(
-              new PaymentRequest(
-                  SOMEONE_ELSE,
-                  ACCOUNT,
-                  new IdempotencyKey("owners-key"),
-                  Money.of("250.00", "CHF"),
-                  BENEFICIARY,
-                  "invoice 42"));
-
-      assertThat(intruder).isInstanceOf(PaymentResult.Rejected.class);
-      assertThat(intruder.outcome()).isEqualTo(PaymentOutcome.ACCOUNT_NOT_OWNED);
-      assertThat(intruder.journalEntry()).isEmpty();
-    }
-
-    @Test
-    @DisplayName("reusing a key for a different payment is refused, not silently replayed")
-    void rejectsKeyReuseWithADifferentPayload() {
-      // Replaying the stored outcome for a request that differs from the original would tell the
-      // client its new payment succeeded when it was never attempted.
-      givenAccount("1000.00", "CHF");
-      service.submit(request("250.00", "CHF", "same-key"));
-
-      PaymentResult reused = service.submit(request("999.00", "CHF", "same-key"));
-
-      assertThat(reused).isInstanceOf(PaymentResult.Rejected.class);
-      assertThat(reused.outcome()).isEqualTo(PaymentOutcome.IDEMPOTENCY_KEY_REUSED);
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("750.00", "CHF"));
-      assertThat(payments.size()).isEqualTo(1);
-    }
-
-    @Test
-    @DisplayName("an identical retry is still replayed, including an equivalent amount format")
-    void replaysEquivalentRequests() {
-      givenAccount("1000.00", "CHF");
-      service.submit(request("250.00", "CHF", "same-key"));
-
-      // 250.0 and 250.00 are the same money; a client re-serialising its request must not be
-      // treated as having changed it.
-      assertThat(service.submit(request("250.0", "CHF", "same-key")))
-          .isInstanceOf(PaymentResult.Replayed.class);
-    }
-
-    @Test
-    @DisplayName("a different key on the same account is a different payment")
-    void treatsDistinctKeysAsDistinctPayments() {
-      givenAccount("1000.00", "CHF");
-
-      service.submit(request("100.00", "CHF", "key-1"));
-      service.submit(request("100.00", "CHF", "key-2"));
-
-      assertThat(payments.size()).isEqualTo(2);
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("800.00", "CHF"));
-    }
+    assertThat(result.outcome()).isEqualTo(PaymentOutcome.ACCOUNT_NOT_FOUND);
+    assertThat(result.payment()).isNull();
+    assertThat(balance(owner.account())).isEqualByComparingTo("990.00");
+    assertThat(service.account(intruder.user(), owner.account())).isEmpty();
   }
 
-  @Nested
-  class Rejections {
+  @Test
+  void rejectsACurrencyMismatch() {
+    Fixture f = givenAccount("1000.00", "EUR");
 
-    @Test
-    void rejectsUnknownAccount() {
-      PaymentResult result = service.submit(request("10.00", "CHF", "key-1"));
+    assertThat(service.submit(f.request("10.00", "key-1")).outcome())
+        .isEqualTo(PaymentOutcome.CURRENCY_MISMATCH);
+    assertThat(payments(f.account())).isZero();
+  }
 
-      assertThat(result).isInstanceOf(PaymentResult.Rejected.class);
-      assertThat(result.outcome()).isEqualTo(PaymentOutcome.ACCOUNT_NOT_FOUND);
-      assertThat(result.journalEntry()).isEmpty();
-    }
+  @Test
+  @DisplayName("a payment is only readable through the account it was made from")
+  void scopesPaymentReadsToTheirAccount() {
+    Fixture f = givenAccount("1000.00", "CHF");
+    Fixture other = givenAccount(f.user(), "0.00", "CHF");
+    UUID paymentId = service.submit(f.request("10.00", "key-1")).payment().id();
 
-    @Test
-    @DisplayName("an account belonging to another user is refused, and nothing is journalled")
-    void rejectsAccountOwnedByAnotherUser() {
-      givenAccount("1000.00", "CHF");
+    assertThat(service.payment(f.user(), other.account(), paymentId)).isEmpty();
+  }
 
-      PaymentRequest fromOtherUser =
-          new PaymentRequest(
-              SOMEONE_ELSE,
-              ACCOUNT,
-              new IdempotencyKey("key-1"),
-              Money.of("10.00", "CHF"),
-              BENEFICIARY,
-              null);
+  @Test
+  void normalisesTheRequest() {
+    PaymentRequest request =
+        new PaymentRequest(
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            "k",
+            new BigDecimal("10.5"),
+            "CHF",
+            " Acme ",
+            "ch93 0076",
+            " ");
 
-      PaymentResult result = service.submit(fromOtherUser);
-
-      assertThat(result.outcome()).isEqualTo(PaymentOutcome.ACCOUNT_NOT_OWNED);
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("1000.00", "CHF"));
-      assertThat(payments.size()).isZero();
-    }
-
-    @Test
-    @DisplayName("the ownership failure is not disclosed to the caller")
-    void doesNotRevealThatTheAccountExists() {
-      givenAccount("1000.00", "CHF");
-
-      PaymentResult owned = service.submit(request("10.00", "CHF", "key-1"));
-      PaymentResult notOwned =
-          service.submit(
-              new PaymentRequest(
-                  SOMEONE_ELSE,
-                  ACCOUNT,
-                  new IdempotencyKey("key-2"),
-                  Money.of("10.00", "CHF"),
-                  BENEFICIARY,
-                  null));
-      PaymentResult unknown =
-          service.submit(
-              new PaymentRequest(
-                  OWNER,
-                  new AccountId(UUID.randomUUID()),
-                  new IdempotencyKey("key-3"),
-                  Money.of("10.00", "CHF"),
-                  BENEFICIARY,
-                  null));
-
-      assertThat(owned).isInstanceOf(PaymentResult.Completed.class);
-      // Distinguishable in metrics, indistinguishable to the client: telling an attacker that an
-      // account exists but is not theirs is itself a disclosure.
-      assertThat(((PaymentResult.Rejected) notOwned).detail())
-          .isEqualTo(((PaymentResult.Rejected) unknown).detail());
-      assertThat(attempts(PaymentOutcome.ACCOUNT_NOT_OWNED)).isEqualTo(1);
-      assertThat(attempts(PaymentOutcome.ACCOUNT_NOT_FOUND)).isEqualTo(1);
-    }
-
-    @Test
-    @DisplayName("a currency other than the account's is refused, with no conversion attempted")
-    void rejectsCurrencyMismatch() {
-      givenAccount("1000.00", "CHF");
-
-      PaymentResult result = service.submit(request("10.00", "EUR", "key-1"));
-
-      assertThat(result.outcome()).isEqualTo(PaymentOutcome.CURRENCY_MISMATCH);
-      assertThat(((PaymentResult.Rejected) result).detail()).contains("EUR").contains("CHF");
-      assertThat(accounts.findById(ACCOUNT).orElseThrow().balance())
-          .isEqualTo(Money.of("1000.00", "CHF"));
-      assertThat(payments.size()).isZero();
-    }
+    assertThat(request.amount()).isEqualTo(new BigDecimal("10.5000"));
+    assertThat(request.beneficiaryName()).isEqualTo("Acme");
+    assertThat(request.beneficiaryIban()).isEqualTo("CH930076");
+    assertThat(request.reference()).isNull();
   }
 }

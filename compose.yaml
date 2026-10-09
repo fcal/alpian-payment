@@ -1,12 +1,5 @@
-# Local development stack.
-#
-# `spring-boot-docker-compose` (a developmentOnly dependency) starts this file on `bootRun`
-# and wires spring.datasource.* and spring.kafka.bootstrap-servers from the running
-# containers, so no connection details are duplicated in application.yaml.
-#
-# SECURITY: everything here is unauthenticated and unencrypted -- trust-auth Postgres,
-# PLAINTEXT Kafka with no SASL and no TLS. This is a deliberate scope exclusion for the
-# exercise, not an oversight. See the Security section of README.md.
+# Local stack, started automatically on `bootRun` by spring-boot-docker-compose.
+# Unauthenticated and unencrypted: development only.
 
 services:
   postgres:
@@ -24,7 +17,7 @@ services:
       retries: 30
 
   kafka:
-    # KRaft mode: no ZooKeeper, so the stack is one container lighter and starts faster.
+    # KRaft mode: no ZooKeeper.
     image: apache/kafka:3.8.0
     ports:
       - "9092:9092"
@@ -40,8 +33,7 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      # Topics are created explicitly by the kafka-init service below, so that partition
-      # count and retention are declared rather than defaulted.
+      # Topics are created by kafka-init below.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
@@ -59,7 +51,6 @@ services:
     entrypoint: ["/bin/bash", "/create-topics.sh"]
     environment:
       BOOTSTRAP_SERVER: kafka:29092
-    # Labelled so spring-boot-docker-compose does not wait on this one-shot job as if it
-    # were a long-running service.
+    # A one-shot job: spring-boot-docker-compose must not wait for it.
     labels:
       org.springframework.boot.ignore: "true"

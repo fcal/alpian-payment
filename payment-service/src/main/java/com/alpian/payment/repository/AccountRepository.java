@@ -1,50 +1,75 @@
 package com.alpian.payment.repository;
 
 import com.alpian.payment.domain.Account;
-import com.alpian.payment.domain.AccountId;
-import com.alpian.payment.domain.Money;
-import com.alpian.payment.domain.UserId;
+import java.math.BigDecimal;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Duration;
 import java.util.Optional;
+import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.jdbc.UncategorizedSQLException;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Repository;
 
-/**
- * Account persistence.
- *
- * <p>Note that {@link #debit} is not a CRUD operation but a single conditional one. This is
- * deliberate, and is the most consequential shape decision in the codebase.
- *
- * <p>A CRUD interface — {@code findById} then {@code save} — would force every caller into a
- * read-modify-write sequence. Two concurrent requests would then both read a sufficient balance and
- * both debit it, and <em>no implementation could prevent it</em>, because the gap between the read
- * and the write lives in the caller. Expressing the balance check and the debit as one operation
- * moves that gap inside the implementation, where it can be closed with a row lock.
- *
- * <p>The division of responsibility is therefore: this interface guarantees that a debit is atomic
- * and never overdraws; the service layer decides what each outcome <em>means</em> — which error the
- * client sees, what is written to the journal, which metric is incremented. Policy stays in the
- * service, atomicity lives with the storage that can actually provide it.
- */
-public interface AccountRepository {
+@Repository
+public class AccountRepository {
 
-  /** Looks up an account regardless of owner. */
-  Optional<Account> findById(AccountId id);
+  private static final String LOCK_NOT_AVAILABLE = "55P03";
 
-  /**
-   * Atomically debits {@code amount} from the account, if and only if the currencies match and the
-   * balance covers it in full.
-   *
-   * <p>Implementations must make the check and the decrement indivisible with respect to other
-   * callers, including callers in other processes. Returning {@link DebitResult.InsufficientFunds}
-   * must leave the balance untouched.
-   *
-   * @return what happened, never null
-   */
-  DebitResult debit(AccountId id, Money amount);
+  private static final String SELECT =
+      "SELECT id, user_id, balance, currency, updated_at FROM account WHERE id = :id";
+
+  private final JdbcClient jdbc;
+  private final long lockTimeoutMillis;
+
+  public AccountRepository(
+      JdbcClient jdbc, @Value("${payment.lock-timeout:3s}") Duration lockTimeout) {
+    this.jdbc = jdbc;
+    this.lockTimeoutMillis = lockTimeout.toMillis();
+  }
+
+  public Optional<Account> find(UUID id) {
+    return jdbc.sql(SELECT).param("id", id).query(AccountRepository::map).optional();
+  }
 
   /**
-   * Persists an account. Present for test fixtures and for seeding; not used by the payment path.
+   * Locks the account row until the end of the current transaction, which serialises payments on
+   * one account. Waits at most {@code payment.lock-timeout}, then throws {@code
+   * CannotAcquireLockException}: a bounded wait keeps one hot account from exhausting the pool.
    */
-  Account save(Account account);
+  public Optional<Account> lock(UUID id) {
+    // SET LOCAL scopes the timeout to this transaction. SET takes no bind parameters.
+    jdbc.sql("SET LOCAL lock_timeout = " + lockTimeoutMillis).update();
+    try {
+      return jdbc.sql(SELECT + " FOR UPDATE")
+          .param("id", id)
+          .query(AccountRepository::map)
+          .optional();
+    } catch (UncategorizedSQLException e) {
+      // Spring leaves Postgres' lock_not_available uncategorised; translate it here.
+      if (LOCK_NOT_AVAILABLE.equals(e.getSQLException().getSQLState())) {
+        throw new CannotAcquireLockException("Account " + id + " is locked", e);
+      }
+      throw e;
+    }
+  }
 
-  /** Accounts belonging to a user. */
-  java.util.List<Account> findByUserId(UserId userId);
+  /** Call with the row locked; the CHECK (balance >= 0) constraint backs this up. */
+  public void debit(UUID id, BigDecimal amount) {
+    jdbc.sql("UPDATE account SET balance = balance - :amount, updated_at = now() WHERE id = :id")
+        .param("amount", amount)
+        .param("id", id)
+        .update();
+  }
+
+  private static Account map(ResultSet rs, int row) throws SQLException {
+    return new Account(
+        rs.getObject("id", UUID.class),
+        rs.getObject("user_id", UUID.class),
+        rs.getBigDecimal("balance"),
+        rs.getString("currency"),
+        rs.getTimestamp("updated_at").toInstant());
+  }
 }

@@ -19,9 +19,7 @@ postgresql = { module = "org.postgresql:postgresql", version = "42.7.4" }
 flyway-core = { module = "org.flywaydb:flyway-core" }
 flyway-postgresql = { module = "org.flywaydb:flyway-database-postgresql" }
 
-# Unversioned: Spring Boot manages the Kafka version, and kafka-streams must match the
-# kafka-clients that Spring Kafka is built against. Pinning Streams separately lets Boot pull
-# clients back underneath it, and Streams then fails at runtime with NoClassDefFoundError.
+# Unversioned: must match the kafka-clients version Spring Boot manages.
 kafka-streams = { module = "org.apache.kafka:kafka-streams" }
 kafka-streams-test-utils = { module = "org.apache.kafka:kafka-streams-test-utils" }
 

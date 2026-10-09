@@ -4,8 +4,7 @@ plugins {
 }
 
 dependencies {
-    // `api` so consumers of this module get the protobuf runtime transitively: generated
-    // message classes expose protobuf-java types in their public API.
+    // `api`: generated classes expose protobuf types.
     api libs.protobuf.java
 }
 
@@ -16,7 +15,7 @@ protobuf {
 }
 
 spotless {
-    // Nothing hand-written in this module; everything under src/main/proto is generated from.
+    // Only generated code here.
     java {
         target 'src/main/java/**/*.java'
     }

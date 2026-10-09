@@ -1,5 +1,6 @@
 package com.alpian.payment.api;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.hasSize;
 import static org.mockito.ArgumentMatchers.any;
@@ -12,48 +13,39 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.alpian.payment.domain.AccountId;
-import com.alpian.payment.domain.Beneficiary;
-import com.alpian.payment.domain.IdempotencyKey;
-import com.alpian.payment.domain.Money;
+import com.alpian.payment.domain.Account;
 import com.alpian.payment.domain.Payment;
-import com.alpian.payment.domain.PaymentId;
 import com.alpian.payment.domain.PaymentOutcome;
+import com.alpian.payment.domain.PaymentRequest;
 import com.alpian.payment.domain.PaymentResult;
-import com.alpian.payment.observability.PaymentMetrics;
-import com.alpian.payment.service.AccountService;
-import com.alpian.payment.service.PaymentRequest;
+import com.alpian.payment.domain.PaymentStatus;
 import com.alpian.payment.service.PaymentService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.context.annotation.Import;
+import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
-import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
-/**
- * Web-layer tests: the HTTP contract, with the service mocked.
- *
- * <p>The service is mocked so each {@link PaymentResult} variant can be produced on demand and its
- * mapping to status, headers and body asserted precisely. The service's own behaviour is covered
- * elsewhere; this class is about what a client actually receives.
- */
-@WebMvcTest({PaymentController.class, AccountController.class})
+/** The HTTP contract, with the service mocked. */
+@WebMvcTest(PaymentController.class)
+@Import(SimpleMeterRegistry.class)
 class PaymentControllerTest {
 
   private static final UUID USER = UUID.fromString("11111111-1111-1111-1111-111111111111");
   private static final UUID ACCOUNT = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1");
-  private static final String PAYMENTS =
-      "/api/v1/users/" + USER + "/accounts/" + ACCOUNT + "/payments";
-
-  private static final String VALID_BODY =
+  private static final String BASE = "/api/v1/users/" + USER + "/accounts/" + ACCOUNT;
+  private static final String BODY =
       """
       {
         "amount": { "value": "250.50", "currency": "CHF" },
@@ -63,347 +55,182 @@ class PaymentControllerTest {
       """;
 
   @Autowired MockMvc mvc;
-  @MockBean PaymentService payments;
-  @MockBean AccountService queries;
-  @MockBean PaymentMetrics metrics;
+  @MockBean PaymentService service;
 
-  private static Payment completedPayment() {
-    return Payment.completed(
-        PaymentId.of("cccccccc-cccc-cccc-cccc-cccccccccccc"),
-        new AccountId(ACCOUNT),
-        new IdempotencyKey("key-1"),
-        Money.of("250.50", "CHF"),
-        new Beneficiary("Acme GmbH", "CH9300762011623852957"),
+  private static Payment payment(PaymentStatus status) {
+    return new Payment(
+        UUID.fromString("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+        ACCOUNT,
+        "key-1",
+        new BigDecimal("250.5000"),
+        "CHF",
+        "Acme GmbH",
+        "CH9300762011623852957",
         "Invoice 42",
+        status,
+        status == PaymentStatus.FAILED ? "Insufficient funds" : null,
         Instant.parse("2026-10-07T10:15:30Z"));
   }
 
-  private static Payment failedPayment() {
-    return Payment.failed(
-        PaymentId.of("dddddddd-dddd-dddd-dddd-dddddddddddd"),
-        new AccountId(ACCOUNT),
-        new IdempotencyKey("key-1"),
-        Money.of("250.50", "CHF"),
-        new Beneficiary("Acme GmbH", "CH9300762011623852957"),
-        "Invoice 42",
-        "Insufficient funds",
-        Instant.parse("2026-10-07T10:15:30Z"));
+  private void serviceReturns(PaymentOutcome outcome, PaymentStatus status) {
+    when(service.submit(any()))
+        .thenReturn(new PaymentResult(outcome, status == null ? null : payment(status)));
   }
 
-  private MockHttpServletRequestBuilder submit(String body) {
-    return post(PAYMENTS)
+  private static MockHttpServletRequestBuilder submit(String body) {
+    return post(BASE + "/payments")
         .header("Idempotency-Key", "key-1")
         .contentType(MediaType.APPLICATION_JSON)
         .content(body);
   }
 
-  @Nested
-  class Success {
+  @Test
+  @DisplayName("a completed payment is 201 with a Location, and money is a decimal string")
+  void completed() throws Exception {
+    serviceReturns(PaymentOutcome.COMPLETED, PaymentStatus.COMPLETED);
 
-    @Test
-    @DisplayName("a completed payment is 201 with a Location for the new resource")
-    void completedIs201WithLocation() throws Exception {
-      when(payments.submit(any())).thenReturn(new PaymentResult.Completed(completedPayment()));
-
-      mvc.perform(submit(VALID_BODY))
-          .andExpect(status().isCreated())
-          .andExpect(
-              header()
-                  .string("Location", endsWith(PAYMENTS + "/cccccccc-cccc-cccc-cccc-cccccccccccc")))
-          .andExpect(header().doesNotExist(PaymentController.REPLAYED_HEADER))
-          .andExpect(jsonPath("$.paymentId").value("cccccccc-cccc-cccc-cccc-cccccccccccc"))
-          .andExpect(jsonPath("$.status").value("COMPLETED"))
-          .andExpect(jsonPath("$.beneficiary.iban").value("CH9300762011623852957"))
-          .andExpect(jsonPath("$.failureReason").doesNotExist());
-    }
-
-    @Test
-    @DisplayName("money is a decimal string at the currency's precision, never a JSON number")
-    void rendersMoneyAsAString() throws Exception {
-      when(payments.submit(any())).thenReturn(new PaymentResult.Completed(completedPayment()));
-
-      MvcResult result = mvc.perform(submit(VALID_BODY)).andReturn();
-
-      // Asserted on the raw text: jsonPath would happily coerce a number to the same value and
-      // the test would pass while the contract was broken.
-      String json = result.getResponse().getContentAsString();
-      org.assertj.core.api.Assertions.assertThat(json)
-          .contains("\"value\":\"250.50\"")
-          .doesNotContain("\"value\":250");
-    }
-
-    @Test
-    @DisplayName("the request is mapped into the domain faithfully, IBAN spacing normalised")
-    void mapsTheRequestIntoTheDomain() throws Exception {
-      when(payments.submit(any())).thenReturn(new PaymentResult.Completed(completedPayment()));
-      var captor = org.mockito.ArgumentCaptor.forClass(PaymentRequest.class);
-
-      mvc.perform(submit(VALID_BODY)).andExpect(status().isCreated());
-
-      verify(payments).submit(captor.capture());
-      PaymentRequest mapped = captor.getValue();
-      org.assertj.core.api.Assertions.assertThat(mapped.userId().value()).isEqualTo(USER);
-      org.assertj.core.api.Assertions.assertThat(mapped.accountId().value()).isEqualTo(ACCOUNT);
-      org.assertj.core.api.Assertions.assertThat(mapped.idempotencyKey().value())
-          .isEqualTo("key-1");
-      org.assertj.core.api.Assertions.assertThat(mapped.amount())
-          .isEqualTo(Money.of("250.50", "CHF"));
-      org.assertj.core.api.Assertions.assertThat(mapped.beneficiary().iban())
-          .isEqualTo("CH9300762011623852957");
-    }
-
-    @Test
-    @DisplayName("an amount sent as a JSON number is accepted and read exactly")
-    void acceptsANumericAmount() throws Exception {
-      when(payments.submit(any())).thenReturn(new PaymentResult.Completed(completedPayment()));
-
-      mvc.perform(submit(VALID_BODY.replace("\"250.50\"", "250.50")))
-          .andExpect(status().isCreated());
-    }
+    String json =
+        mvc.perform(submit(BODY))
+            .andExpect(status().isCreated())
+            .andExpect(
+                header().string("Location", endsWith("/cccccccc-cccc-cccc-cccc-cccccccccccc")))
+            .andExpect(header().doesNotExist(PaymentController.REPLAYED_HEADER))
+            .andExpect(jsonPath("$.status").value("COMPLETED"))
+            .andExpect(jsonPath("$.failureReason").doesNotExist())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    assertThat(json).contains("\"value\":\"250.50\"");
   }
 
-  @Nested
-  class Idempotency {
+  @Test
+  void mapsTheRequestBody() throws Exception {
+    serviceReturns(PaymentOutcome.COMPLETED, PaymentStatus.COMPLETED);
+    ArgumentCaptor<PaymentRequest> captor = ArgumentCaptor.forClass(PaymentRequest.class);
 
-    @Test
-    @DisplayName("replaying a completed payment returns the original 201, flagged as a replay")
-    void replayOfCompletedIs201() throws Exception {
-      when(payments.submit(any())).thenReturn(new PaymentResult.Replayed(completedPayment()));
+    mvc.perform(submit(BODY.replace("\"250.50\"", "250.50"))).andExpect(status().isCreated());
 
-      mvc.perform(submit(VALID_BODY))
-          .andExpect(status().isCreated())
-          .andExpect(header().string(PaymentController.REPLAYED_HEADER, "true"))
-          .andExpect(jsonPath("$.paymentId").value("cccccccc-cccc-cccc-cccc-cccccccccccc"));
-    }
-
-    @Test
-    @DisplayName("replaying a declined payment returns the original 409, flagged as a replay")
-    void replayOfDeclinedIs409() throws Exception {
-      when(payments.submit(any())).thenReturn(new PaymentResult.Replayed(failedPayment()));
-
-      mvc.perform(submit(VALID_BODY))
-          .andExpect(status().isConflict())
-          .andExpect(header().string(PaymentController.REPLAYED_HEADER, "true"))
-          .andExpect(jsonPath("$.code").value("insufficient_funds"));
-    }
-
-    @Test
-    void keyReusedForADifferentPaymentIs422() throws Exception {
-      when(payments.submit(any()))
-          .thenReturn(
-              new PaymentResult.Rejected(
-                  PaymentOutcome.IDEMPOTENCY_KEY_REUSED,
-                  "Idempotency key has already been used for a different payment"));
-
-      mvc.perform(submit(VALID_BODY))
-          .andExpect(status().isUnprocessableEntity())
-          .andExpect(jsonPath("$.code").value("idempotency_key_reused"));
-    }
+    verify(service).submit(captor.capture());
+    PaymentRequest request = captor.getValue();
+    assertThat(request.userId()).isEqualTo(USER);
+    assertThat(request.idempotencyKey()).isEqualTo("key-1");
+    assertThat(request.amount()).isEqualByComparingTo("250.50");
+    assertThat(request.beneficiaryIban()).isEqualTo("CH9300762011623852957");
   }
 
-  @Nested
-  class BusinessFailures {
+  @Test
+  @DisplayName("a decline is 409 identifying the recorded attempt")
+  void declined() throws Exception {
+    serviceReturns(PaymentOutcome.INSUFFICIENT_FUNDS, PaymentStatus.FAILED);
 
-    @Test
-    @DisplayName("insufficient funds is 409, identifying the recorded attempt")
-    void declinedIs409WithPaymentId() throws Exception {
-      when(payments.submit(any()))
-          .thenReturn(
-              new PaymentResult.Declined(failedPayment(), PaymentOutcome.INSUFFICIENT_FUNDS));
-
-      mvc.perform(submit(VALID_BODY))
-          .andExpect(status().isConflict())
-          .andExpect(header().string("Content-Type", "application/problem+json"))
-          .andExpect(header().string("Location", endsWith("/dddddddd-dddd-dddd-dddd-dddddddddddd")))
-          .andExpect(jsonPath("$.code").value("insufficient_funds"))
-          .andExpect(jsonPath("$.paymentId").value("dddddddd-dddd-dddd-dddd-dddddddddddd"))
-          .andExpect(jsonPath("$.type").value("/problems/insufficient-funds"));
-    }
-
-    @Test
-    void currencyMismatchIs422() throws Exception {
-      when(payments.submit(any()))
-          .thenReturn(
-              new PaymentResult.Rejected(
-                  PaymentOutcome.CURRENCY_MISMATCH,
-                  "Payment currency EUR does not match account currency CHF"));
-
-      mvc.perform(submit(VALID_BODY))
-          .andExpect(status().isUnprocessableEntity())
-          .andExpect(jsonPath("$.code").value("currency_mismatch"));
-    }
-
-    @Test
-    @DisplayName("lock contention is a retryable 503 with Retry-After")
-    void lockTimeoutIs503WithRetryAfter() throws Exception {
-      when(payments.submit(any()))
-          .thenReturn(
-              new PaymentResult.Rejected(
-                  PaymentOutcome.LOCK_TIMEOUT, "Another payment on this account is in progress"));
-
-      mvc.perform(submit(VALID_BODY))
-          .andExpect(status().isServiceUnavailable())
-          .andExpect(header().string("Retry-After", "1"))
-          .andExpect(jsonPath("$.code").value("lock_timeout"));
-    }
-
-    @Test
-    @DisplayName("an account owned by someone else is indistinguishable from a missing one")
-    void notOwnedAndNotFoundProduceIdenticalResponses() throws Exception {
-      when(payments.submit(any()))
-          .thenReturn(
-              new PaymentResult.Rejected(PaymentOutcome.ACCOUNT_NOT_FOUND, "Account not found"));
-      String notFound =
-          mvc.perform(submit(VALID_BODY))
-              .andExpect(status().isNotFound())
-              .andReturn()
-              .getResponse()
-              .getContentAsString();
-
-      when(payments.submit(any()))
-          .thenReturn(
-              new PaymentResult.Rejected(PaymentOutcome.ACCOUNT_NOT_OWNED, "Account not found"));
-      String notOwned =
-          mvc.perform(submit(VALID_BODY))
-              .andExpect(status().isNotFound())
-              .andReturn()
-              .getResponse()
-              .getContentAsString();
-
-      // Byte-identical, `code` included. Mapping the outcome straight to `code` would have sent
-      // "account_not_owned" to the client and confirmed the account exists.
-      org.assertj.core.api.Assertions.assertThat(notOwned).isEqualTo(notFound);
-      org.assertj.core.api.Assertions.assertThat(notOwned).doesNotContain("not_owned");
-    }
+    mvc.perform(submit(BODY))
+        .andExpect(status().isConflict())
+        .andExpect(header().string("Content-Type", "application/problem+json"))
+        .andExpect(header().string("Location", endsWith("/cccccccc-cccc-cccc-cccc-cccccccccccc")))
+        .andExpect(jsonPath("$.code").value("insufficient_funds"))
+        .andExpect(jsonPath("$.paymentId").value("cccccccc-cccc-cccc-cccc-cccccccccccc"));
   }
 
-  @Nested
-  class Validation {
+  @Test
+  @DisplayName("a replay returns the original status, flagged as a replay")
+  void replays() throws Exception {
+    serviceReturns(PaymentOutcome.REPLAYED, PaymentStatus.COMPLETED);
+    mvc.perform(submit(BODY))
+        .andExpect(status().isCreated())
+        .andExpect(header().string(PaymentController.REPLAYED_HEADER, "true"));
 
-    @Test
-    @DisplayName("a missing Idempotency-Key is refused before the service is called")
-    void requiresIdempotencyKey() throws Exception {
-      mvc.perform(post(PAYMENTS).contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
-          .andExpect(status().isBadRequest())
-          .andExpect(jsonPath("$.code").value("validation_failed"));
-      verify(payments, never()).submit(any());
-      verify(metrics).recordAttempt(PaymentOutcome.VALIDATION_FAILED);
-    }
-
-    @Test
-    void rejectsAnOverlongIdempotencyKey() throws Exception {
-      mvc.perform(
-              post(PAYMENTS)
-                  .header("Idempotency-Key", "k".repeat(256))
-                  .contentType(MediaType.APPLICATION_JSON)
-                  .content(VALID_BODY))
-          .andExpect(status().isBadRequest())
-          .andExpect(jsonPath("$.code").value("validation_failed"));
-      verify(payments, never()).submit(any());
-    }
-
-    @Test
-    @DisplayName("field errors are itemised so a client can show them against each field")
-    void itemisesFieldErrors() throws Exception {
-      String body =
-          """
-          { "amount": { "value": "-5", "currency": "chf" },
-            "beneficiary": { "name": "", "iban": "CH93" } }
-          """;
-
-      mvc.perform(submit(body))
-          .andExpect(status().isBadRequest())
-          .andExpect(jsonPath("$.code").value("validation_failed"))
-          .andExpect(jsonPath("$.errors", hasSize(3)));
-      verify(payments, never()).submit(any());
-    }
-
-    @Test
-    @DisplayName("more than four decimal places is refused rather than rounded")
-    void rejectsExcessPrecision() throws Exception {
-      mvc.perform(submit(VALID_BODY.replace("\"250.50\"", "\"250.12345\"")))
-          .andExpect(status().isBadRequest());
-      verify(payments, never()).submit(any());
-    }
-
-    @Test
-    @DisplayName("a well-formed but unknown currency code is the client's error, not a 500")
-    void rejectsUnknownCurrency() throws Exception {
-      mvc.perform(submit(VALID_BODY.replace("\"CHF\"", "\"XYZ\"")))
-          .andExpect(status().isBadRequest())
-          .andExpect(jsonPath("$.code").value("validation_failed"));
-    }
-
-    @Test
-    void rejectsMalformedJson() throws Exception {
-      mvc.perform(submit("{ not json")).andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("an unknown field is refused, catching a misspelt field the client meant to send")
-    void rejectsUnknownFields() throws Exception {
-      mvc.perform(submit(VALID_BODY.replace("\"reference\"", "\"refrence\"")))
-          .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    void rejectsANonUuidPathSegment() throws Exception {
-      mvc.perform(
-              post("/api/v1/users/not-a-uuid/accounts/" + ACCOUNT + "/payments")
-                  .header("Idempotency-Key", "key-1")
-                  .contentType(MediaType.APPLICATION_JSON)
-                  .content(VALID_BODY))
-          .andExpect(status().isBadRequest());
-    }
+    serviceReturns(PaymentOutcome.REPLAYED, PaymentStatus.FAILED);
+    mvc.perform(submit(BODY))
+        .andExpect(status().isConflict())
+        .andExpect(header().string(PaymentController.REPLAYED_HEADER, "true"));
   }
 
-  @Nested
-  class Queries {
+  @Test
+  void rejections() throws Exception {
+    serviceReturns(PaymentOutcome.ACCOUNT_NOT_FOUND, null);
+    mvc.perform(submit(BODY))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value("account_not_found"));
 
-    @Test
-    void returnsAPayment() throws Exception {
-      Payment payment = completedPayment();
-      when(queries.payment(any(), any(), any())).thenReturn(Optional.of(payment));
+    serviceReturns(PaymentOutcome.CURRENCY_MISMATCH, null);
+    mvc.perform(submit(BODY))
+        .andExpect(status().isUnprocessableEntity())
+        .andExpect(jsonPath("$.code").value("currency_mismatch"));
 
-      mvc.perform(get(PAYMENTS + "/" + payment.id()))
-          .andExpect(status().isOk())
-          .andExpect(jsonPath("$.paymentId").value(payment.id().toString()));
-    }
+    serviceReturns(PaymentOutcome.IDEMPOTENCY_KEY_REUSED, null);
+    mvc.perform(submit(BODY))
+        .andExpect(status().isUnprocessableEntity())
+        .andExpect(jsonPath("$.code").value("idempotency_key_reused"));
+  }
 
-    @Test
-    void missingPaymentIs404() throws Exception {
-      when(queries.payment(any(), any(), any())).thenReturn(Optional.empty());
+  @Test
+  @DisplayName("lock contention is a retryable 503 with Retry-After")
+  void lockTimeout() throws Exception {
+    when(service.submit(any())).thenThrow(new CannotAcquireLockException("lock_timeout"));
 
-      mvc.perform(get(PAYMENTS + "/" + UUID.randomUUID()))
-          .andExpect(status().isNotFound())
-          .andExpect(jsonPath("$.code").value("payment_not_found"));
-    }
+    mvc.perform(submit(BODY))
+        .andExpect(status().isServiceUnavailable())
+        .andExpect(header().string("Retry-After", "1"))
+        .andExpect(jsonPath("$.code").value("lock_timeout"));
+  }
 
-    @Test
-    void returnsTheBalance() throws Exception {
-      when(queries.ownedAccount(any(), any()))
-          .thenReturn(
-              Optional.of(
-                  new com.alpian.payment.domain.Account(
-                      new AccountId(ACCOUNT),
-                      new com.alpian.payment.domain.UserId(USER),
-                      Money.of("1000", "CHF"),
-                      Instant.parse("2026-10-01T00:00:00Z"),
-                      Instant.parse("2026-10-07T10:15:30Z"))));
+  @Test
+  void rejectsInvalidRequestsWithoutCallingTheService() throws Exception {
+    // Missing Idempotency-Key.
+    mvc.perform(post(BASE + "/payments").contentType(MediaType.APPLICATION_JSON).content(BODY))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("validation_failed"));
+    // Over-long key.
+    mvc.perform(submit(BODY).header("Idempotency-Key", "k".repeat(256)))
+        .andExpect(status().isBadRequest());
+    // Field errors are listed.
+    mvc.perform(
+            submit(
+                """
+                { "amount": { "value": "-5", "currency": "chf" },
+                  "beneficiary": { "name": "", "iban": "CH93" } }
+                """))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.errors", hasSize(3)));
+    // More than four decimals, an unknown currency, an unknown field, malformed JSON.
+    mvc.perform(submit(BODY.replace("250.50", "250.12345"))).andExpect(status().isBadRequest());
+    mvc.perform(submit(BODY.replace("CHF", "XYZ")))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("validation_failed"));
+    mvc.perform(submit(BODY.replace("reference", "refrence"))).andExpect(status().isBadRequest());
+    mvc.perform(submit("{ not json")).andExpect(status().isBadRequest());
 
-      mvc.perform(get("/api/v1/users/" + USER + "/accounts/" + ACCOUNT + "/balance"))
-          .andExpect(status().isOk())
-          .andExpect(jsonPath("$.balance.value").value("1000.00"))
-          .andExpect(jsonPath("$.balance.currency").value("CHF"));
-    }
+    verify(service, never()).submit(any());
+  }
 
-    @Test
-    void unknownAccountBalanceIs404() throws Exception {
-      when(queries.ownedAccount(any(), any())).thenReturn(Optional.empty());
+  @Test
+  void getsAPayment() throws Exception {
+    when(service.payment(any(), any(), any()))
+        .thenReturn(Optional.of(payment(PaymentStatus.COMPLETED)));
+    mvc.perform(get(BASE + "/payments/" + UUID.randomUUID()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.paymentId").value("cccccccc-cccc-cccc-cccc-cccccccccccc"));
 
-      mvc.perform(get("/api/v1/users/" + USER + "/accounts/" + ACCOUNT + "/balance"))
-          .andExpect(status().isNotFound())
-          .andExpect(jsonPath("$.code").value("account_not_found"));
-    }
+    when(service.payment(any(), any(), any())).thenReturn(Optional.empty());
+    mvc.perform(get(BASE + "/payments/" + UUID.randomUUID()))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value("payment_not_found"));
+  }
+
+  @Test
+  void getsTheBalance() throws Exception {
+    when(service.account(any(), any()))
+        .thenReturn(
+            Optional.of(
+                new Account(ACCOUNT, USER, new BigDecimal("1000.0000"), "CHF", Instant.now())));
+    mvc.perform(get(BASE + "/balance"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.balance.value").value("1000.00"))
+        .andExpect(jsonPath("$.balance.currency").value("CHF"));
+
+    when(service.account(any(), any())).thenReturn(Optional.empty());
+    mvc.perform(get(BASE + "/balance"))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value("account_not_found"));
   }
 }

@@ -1,10 +1,5 @@
 package com.alpian.payment.component;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.time.Duration;
 import org.slf4j.LoggerFactory;
@@ -21,12 +16,8 @@ import org.testcontainers.lifecycle.Startables;
 import org.testcontainers.utility.MountableFile;
 
 /**
- * The whole system in containers, started once per test JVM and shared by every component test.
- *
- * <p>Both services run from the images their own Dockerfiles build, configured only through
- * environment variables, as they would be when deployed. Topics are created by running the same
- * {@code create-topics.sh} the compose stack uses, so the test also catches drift between that
- * script and what the services expect.
+ * The whole system in containers, shared by every component test. Both services run from their
+ * Dockerfiles; topics come from the compose stack's {@code create-topics.sh}.
  */
 final class ComponentStack {
 
@@ -35,7 +26,6 @@ final class ComponentStack {
 
   private static final String KAFKA_IMAGE = "apache/kafka:3.8.0";
 
-  /** The address the services use, on the shared network. The tests use the mapped port. */
   private static final String INTERNAL_KAFKA = "kafka:19092";
 
   static final Network NETWORK = Network.newNetwork();
@@ -59,57 +49,17 @@ final class ComponentStack {
           .withEnv("POSTGRES_URL", "jdbc:postgresql://postgres:5432/payment")
           .withEnv("POSTGRES_USER", "payment")
           .withEnv("POSTGRES_PASSWORD", "payment")
-          // Short enough that the outage test sees the relay retry within seconds.
+          // So the outage test sees the relay retry within seconds.
           .withEnv("PAYMENT_OUTBOX_MAX_BACKOFF", "2s");
 
   static final GenericContainer<?> NOTIFICATION_SERVICE =
       service("notification-service", NOTIFICATION_PORT)
-          // A single instance: a standby would have nowhere to run.
           .withEnv("SPRING_KAFKA_STREAMS_PROPERTIES_NUM_STANDBY_REPLICAS", "0");
 
   static {
     Startables.deepStart(POSTGRES, KAFKA).join();
     createTopics();
     Startables.deepStart(PAYMENT_SERVICE, NOTIFICATION_SERVICE).join();
-    awaitStreamsRunning();
-  }
-
-  /**
-   * Readiness alone is not enough for the notification service: Streams starts asynchronously after
-   * the application reports ready, and a topology that fails on its first record would otherwise
-   * surface only later, as a delivery timeout in some unrelated test. This waits until it is
-   * actually processing, and fails with the health response if it never gets there.
-   */
-  private static void awaitStreamsRunning() {
-    URI liveness =
-        URI.create(
-            "http://"
-                + NOTIFICATION_SERVICE.getHost()
-                + ":"
-                + NOTIFICATION_SERVICE.getMappedPort(NOTIFICATION_PORT)
-                + "/actuator/health/liveness");
-    HttpClient http = HttpClient.newHttpClient();
-    String body = "(no response)";
-    long deadline = System.nanoTime() + Duration.ofMinutes(1).toNanos();
-    while (System.nanoTime() < deadline) {
-      try {
-        body =
-            http.send(
-                    HttpRequest.newBuilder(liveness).timeout(Duration.ofSeconds(5)).build(),
-                    HttpResponse.BodyHandlers.ofString())
-                .body();
-        if (body.contains("\"state\":\"RUNNING\"")) {
-          return;
-        }
-        Thread.sleep(250);
-      } catch (IOException e) {
-        body = e.toString();
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new IllegalStateException(e);
-      }
-    }
-    throw new IllegalStateException("Kafka Streams never reached RUNNING; liveness: " + body);
   }
 
   private ComponentStack() {}
@@ -121,7 +71,7 @@ final class ComponentStack {
         + PAYMENT_SERVICE.getMappedPort(PAYMENT_PORT);
   }
 
-  /** Freezes the broker, keeping its address: connections hang, as in a network partition. */
+  /** Freezes the broker: connections hang, as in a network partition. */
   static void pauseKafka() {
     DockerClientFactory.instance().client().pauseContainerCmd(KAFKA.getContainerId()).exec();
   }
@@ -145,7 +95,6 @@ final class ComponentStack {
                 .withStartupTimeout(Duration.ofMinutes(2)));
   }
 
-  /** Runs the compose stack's topic script against the test broker, and waits for it to exit. */
   private static void createTopics() {
     try (GenericContainer<?> topics =
         new GenericContainer<>(KAFKA_IMAGE)

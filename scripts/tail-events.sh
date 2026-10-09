@@ -6,15 +6,10 @@
 #   scripts/tail-events.sh -f          # keep following new records (Ctrl-C to stop)
 #   scripts/tail-events.sh -t TOPIC    # another topic (default: payment-events)
 #
-# The message type is taken from each record's event-type header, so notification-events and
-# the dead-letter topics decode too. A value that does not decode is reported, not fatal.
+# The message type comes from the event-type header. Requires kcat and protoc
+# (brew install kcat protobuf). BOOTSTRAP_SERVER defaults to localhost:9092.
 #
-# Requires kcat and protoc (brew install kcat protobuf). BOOTSTRAP_SERVER overrides the
-# broker address (default: localhost:9092, the port compose.yaml publishes).
-#
-# Records are read in two passes: one kcat stream for the metadata only, then one fetch per
-# record for its value. Values are raw protobuf with no length prefix, so a single stream of
-# concatenated values cannot be split back into messages.
+# Each value is fetched separately: raw protobuf has no length prefix to split a stream on.
 
 set -euo pipefail
 
@@ -26,7 +21,7 @@ while getopts "ft:h" opt; do
   case "$opt" in
     f) follow=true ;;
     t) topic="$OPTARG" ;;
-    *) sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) sed -n '3,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   esac
 done
 
@@ -41,7 +36,7 @@ proto_root="$(cd "$(dirname "$0")/.." && pwd)/proto/src/main/proto"
 proto_file="alpian/payment/v1/payment_events.proto"
 default_message="alpian.payment.v1.PaymentEvent"
 
-# -e exits at the end of the topic; -u unbuffers output so followed records print immediately.
+# -e: exit at the end of the topic; -u: unbuffered, for following.
 mode=-e
 $follow && mode=-u
 

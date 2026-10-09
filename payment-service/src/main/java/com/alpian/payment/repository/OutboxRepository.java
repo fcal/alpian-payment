@@ -1,44 +1,100 @@
 package com.alpian.payment.repository;
 
-import java.time.Instant;
+import java.time.Duration;
 import java.util.List;
-import java.util.Optional;
+import java.util.UUID;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Repository;
 
-/**
- * The transactional outbox.
- *
- * <p>{@link #enqueue} is called inside the payment transaction, so an event exists if and only if
- * the payment committed. Everything else serves the relay that publishes those events afterwards.
- */
-public interface OutboxRepository {
+/** The transactional outbox: events are enqueued in the payment transaction, then relayed. */
+@Repository
+public class OutboxRepository {
 
-  /** Stores an event. Must join the caller's transaction, which is the whole point. */
-  void enqueue(OutboxMessage message);
+  private static final int MAX_ERROR_LENGTH = 1000;
 
-  /**
-   * Claims up to {@code limit} messages due for publication, oldest first, locking them for the
-   * rest of the caller's transaction.
-   *
-   * <p>Rows already locked by another relay are skipped rather than waited for, so concurrent
-   * relays — one per service replica — take disjoint batches without coordinating.
-   *
-   * @param now messages whose next attempt is after this are not yet due
-   */
-  List<OutboxMessage> claimBatch(int limit, Instant now);
+  public record Message(long id, UUID paymentId, String key, byte[] payload, int attempts) {}
 
-  void markPublished(List<Long> ids, Instant publishedAt);
+  private final JdbcClient jdbc;
 
-  /** Records a failed attempt and schedules the next one. */
-  void recordFailure(long id, String error, Instant nextAttemptAt);
+  public OutboxRepository(JdbcClient jdbc) {
+    this.jdbc = jdbc;
+  }
 
-  /** Records a failed attempt and stops retrying the message. */
-  void park(long id, String error, Instant parkedAt);
-
-  /** Size and oldest entry of the unpublished, unparked backlog. */
-  Backlog backlog();
+  public void enqueue(UUID paymentId, String key, byte[] payload) {
+    jdbc.sql("INSERT INTO outbox (payment_id, partition_key, payload) VALUES (:id, :key, :payload)")
+        .param("id", paymentId)
+        .param("key", key)
+        .param("payload", payload)
+        .update();
+  }
 
   /**
-   * @param oldestCreatedAt empty when nothing is pending
+   * Locks up to {@code limit} due messages, oldest first, for the rest of the transaction. {@code
+   * SKIP LOCKED} lets relays on several replicas take disjoint batches without coordination.
    */
-  record Backlog(long pending, Optional<Instant> oldestCreatedAt) {}
+  public List<Message> claimBatch(int limit) {
+    return jdbc.sql(
+            """
+            SELECT id, payment_id, partition_key, payload, attempts
+              FROM outbox
+             WHERE published_at IS NULL AND parked_at IS NULL AND next_attempt_at <= now()
+             ORDER BY id
+             LIMIT :limit
+               FOR UPDATE SKIP LOCKED
+            """)
+        .param("limit", limit)
+        .query(
+            (rs, row) ->
+                new Message(
+                    rs.getLong("id"),
+                    rs.getObject("payment_id", UUID.class),
+                    rs.getString("partition_key"),
+                    rs.getBytes("payload"),
+                    rs.getInt("attempts")))
+        .list();
+  }
+
+  public void markPublished(List<Long> ids) {
+    if (!ids.isEmpty()) {
+      jdbc.sql("UPDATE outbox SET published_at = now() WHERE id IN (:ids)")
+          .param("ids", ids)
+          .update();
+    }
+  }
+
+  public void retryLater(long id, String error, Duration delay) {
+    jdbc.sql(
+            """
+            UPDATE outbox
+               SET attempts = attempts + 1, last_error = :error,
+                   next_attempt_at = now() + make_interval(secs => :delay)
+             WHERE id = :id
+            """)
+        .param("id", id)
+        .param("error", truncate(error))
+        .param("delay", delay.toMillis() / 1000.0)
+        .update();
+  }
+
+  /** Stops retrying a message; it stays in the table for inspection. */
+  public void park(long id, String error) {
+    jdbc.sql(
+            """
+            UPDATE outbox SET attempts = attempts + 1, last_error = :error, parked_at = now()
+             WHERE id = :id
+            """)
+        .param("id", id)
+        .param("error", truncate(error))
+        .update();
+  }
+
+  public long countPending() {
+    return jdbc.sql("SELECT count(*) FROM outbox WHERE published_at IS NULL AND parked_at IS NULL")
+        .query(Long.class)
+        .single();
+  }
+
+  private static String truncate(String error) {
+    return error.length() <= MAX_ERROR_LENGTH ? error : error.substring(0, MAX_ERROR_LENGTH);
+  }
 }

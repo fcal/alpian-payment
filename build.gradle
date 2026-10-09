@@ -1,6 +1,4 @@
 plugins {
-    // No `java` plugin at the root: it holds build configuration only and produces no
-    // artifact of its own.
     alias(libs.plugins.spotless) apply false
 }
 
@@ -30,32 +28,25 @@ subprojects {
         }
     }
 
-    // Both Boot modules share the one stack definition at the repository root.
-    // spring-boot-docker-compose resolves the compose file relative to the working
-    // directory, which for `bootRun` is the module directory -- so without this,
-    // `./gradlew :payment-service:bootRun` fails to find it.
+    // bootRun runs in the module directory; point docker-compose at the root compose.yaml.
     plugins.withId('org.springframework.boot') {
         tasks.named('bootRun') {
             systemProperty 'spring.docker.compose.file',
                     rootProject.file('compose.yaml').absolutePath
         }
-        // A version-free name, so each module's Dockerfile can COPY it without tracking the
-        // project version.
+        // Version-free, so the Dockerfiles need no update on a version bump.
         tasks.named('bootJar') {
             archiveFileName = "${project.name}.jar"
         }
     }
 
-    // Spring Boot's dependency management pins Testcontainers to the version Boot was released
-    // with, silently overriding the catalog (1.20.2 resolved as 1.19.8). Overriding Boot's
-    // version property makes the catalog the single source of truth again.
+    // Otherwise Boot's dependency management overrides the catalog's Testcontainers version.
     plugins.withId('io.spring.dependency-management') {
         ext['testcontainers.version'] = libs.versions.testcontainers.get()
     }
 
     spotless {
         java {
-            // Generated protobuf sources are excluded; we do not own their formatting.
             targetExclude '**/build/generated/**'
             googleJavaFormat(libs.versions.googleJavaFormat.get())
             removeUnusedImports()

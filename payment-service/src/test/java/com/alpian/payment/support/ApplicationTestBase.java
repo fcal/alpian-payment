@@ -1,11 +1,7 @@
 package com.alpian.payment.support;
 
-import com.alpian.payment.domain.Account;
-import com.alpian.payment.domain.AccountId;
-import com.alpian.payment.domain.Money;
-import com.alpian.payment.domain.UserId;
-import com.alpian.payment.repository.AccountRepository;
-import java.time.Instant;
+import com.alpian.payment.domain.PaymentRequest;
+import java.math.BigDecimal;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -14,20 +10,15 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.testcontainers.containers.PostgreSQLContainer;
 
 /**
- * Base for tests that boot the full application against a real PostgreSQL.
- *
- * <p>The container is static and started once, and every subclass shares the same Spring
- * configuration, so the application context is cached and reused across classes. Without that, each
- * test class would pay for a fresh container and a fresh context.
- *
- * <p>Because the database is shared, tests create their own user and account through {@link
- * #givenAccount} rather than relying on the seeded demo rows. Seed data mutated by one class would
- * otherwise make another's assertions depend on execution order.
+ * Boots the application against a shared PostgreSQL container. The relay is off: there is no
+ * broker. Each test creates its own account, so tests do not depend on each other.
  */
-// The relay is off: these tests have no broker, and with it on, payments made here would be
-// published to whatever Kafka listens on localhost:9092 -- on a developer machine, the dev stack.
 @SpringBootTest(
-    properties = {"spring.docker.compose.enabled=false", "payment.outbox.relay-enabled=false"})
+    properties = {
+      "spring.docker.compose.enabled=false",
+      "payment.outbox.relay-enabled=false",
+      "payment.lock-timeout=1s"
+    })
 public abstract class ApplicationTestBase {
 
   @ServiceConnection
@@ -38,20 +29,57 @@ public abstract class ApplicationTestBase {
     POSTGRES.start();
   }
 
-  @Autowired protected AccountRepository accounts;
   @Autowired protected JdbcClient jdbc;
 
-  /** A user who owns a freshly created account. */
-  protected record Fixture(UserId user, AccountId account) {}
+  public record Fixture(UUID user, UUID account) {
+
+    public PaymentRequest request(String amount, String key) {
+      return new PaymentRequest(
+          user,
+          account,
+          key,
+          new BigDecimal(amount),
+          "CHF",
+          "Acme GmbH",
+          "CH93 0076 2011 6238 5295 7",
+          null);
+    }
+  }
 
   protected Fixture givenAccount(String balance, String currency) {
-    UserId user = new UserId(UUID.randomUUID());
-    jdbc.sql("INSERT INTO app_user (id, name) VALUES (:id, 'Test User')")
-        .param("id", user.value())
+    return givenAccount(UUID.randomUUID(), balance, currency);
+  }
+
+  protected Fixture givenAccount(UUID user, String balance, String currency) {
+    Fixture fixture = new Fixture(user, UUID.randomUUID());
+    jdbc.sql(
+            "INSERT INTO account (id, user_id, balance, currency) VALUES (:id, :user, :balance, :currency)")
+        .param("id", fixture.account())
+        .param("user", fixture.user())
+        .param("balance", new BigDecimal(balance))
+        .param("currency", currency)
         .update();
-    AccountId account = new AccountId(UUID.randomUUID());
-    accounts.save(
-        new Account(account, user, Money.of(balance, currency), Instant.now(), Instant.now()));
-    return new Fixture(user, account);
+    return fixture;
+  }
+
+  protected BigDecimal balance(UUID account) {
+    return jdbc.sql("SELECT balance FROM account WHERE id = :id")
+        .param("id", account)
+        .query(BigDecimal.class)
+        .single();
+  }
+
+  protected long payments(UUID account) {
+    return jdbc.sql("SELECT count(*) FROM payment WHERE account_id = :account")
+        .param("account", account)
+        .query(Long.class)
+        .single();
+  }
+
+  protected long outboxRows(UUID account) {
+    return jdbc.sql("SELECT count(*) FROM outbox WHERE partition_key = :account")
+        .param("account", account.toString())
+        .query(Long.class)
+        .single();
   }
 }

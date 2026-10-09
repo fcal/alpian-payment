@@ -1,30 +1,31 @@
 package com.alpian.payment.api;
 
+import static com.alpian.payment.api.ApiExceptionHandler.problem;
+
+import com.alpian.payment.api.dto.BalanceResponse;
+import com.alpian.payment.api.dto.BeneficiaryDto;
 import com.alpian.payment.api.dto.CreatePaymentRequest;
+import com.alpian.payment.api.dto.MoneyDto;
 import com.alpian.payment.api.dto.PaymentResponse;
-import com.alpian.payment.domain.AccountId;
-import com.alpian.payment.domain.IdempotencyKey;
 import com.alpian.payment.domain.Payment;
-import com.alpian.payment.domain.PaymentId;
 import com.alpian.payment.domain.PaymentOutcome;
+import com.alpian.payment.domain.PaymentRequest;
 import com.alpian.payment.domain.PaymentResult;
-import com.alpian.payment.domain.UserId;
-import com.alpian.payment.service.AccountService;
 import com.alpian.payment.service.PaymentService;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
-import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.headers.Header;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
-import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
+import java.math.BigDecimal;
 import java.net.URI;
+import java.util.Currency;
 import java.util.UUID;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -38,203 +39,185 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 /**
- * Submits and retrieves payments.
- *
- * <p><strong>The {@code userId} path segment is a stand-in for authentication.</strong> In
- * production the user must come from the subject of a validated JWT, never from the URL: as
- * written, anyone can claim to be anyone. It is in the path only because authentication is out of
- * scope for this exercise. The ownership check behind it is real, though — an account is only ever
- * acted on for its owner — so replacing the path variable with the authenticated principal is the
- * whole of the change needed.
+ * Payments and balances. The {@code userId} path segment stands in for the authenticated user,
+ * which would come from a validated token in production.
  */
 @RestController
-@RequestMapping("/api/v1/users/{userId}/accounts/{accountId}/payments")
-@Tag(name = "Payments", description = "Outbound payments from an account")
+@RequestMapping("/api/v1/users/{userId}/accounts/{accountId}")
 public class PaymentController {
 
-  /** Set on a response that replays an earlier outcome rather than executing anything. */
   static final String REPLAYED_HEADER = "Idempotent-Replayed";
 
-  private final PaymentService paymentService;
-  private final AccountService accountService;
+  private final PaymentService service;
+  private final MeterRegistry metrics;
 
-  public PaymentController(PaymentService paymentService, AccountService accountService) {
-    this.paymentService = paymentService;
-    this.accountService = accountService;
+  public PaymentController(PaymentService service, MeterRegistry metrics) {
+    this.service = service;
+    this.metrics = metrics;
   }
 
-  @PostMapping
+  @PostMapping("/payments")
   @Operation(
       summary = "Submit an outbound payment",
       description =
           """
-          Debits the account and records the payment, or declines it. Submission is idempotent: \
-          resending a request with the same `Idempotency-Key` returns the original outcome, \
-          including the original status code, with `Idempotent-Replayed: true`, and never debits \
-          twice. A key identifies one attempt — replaying the key of a declined payment returns \
-          that decline even if the account has since been funded. Reusing a key for a different \
-          payment is refused with 422.""")
+          Debits the account and records the payment, or declines it. Idempotent: resending \
+          the same `Idempotency-Key` returns the original response with \
+          `Idempotent-Replayed: true` and never debits twice.""")
   @ApiResponse(
       responseCode = "201",
-      description = "Payment completed",
-      headers = {
-        @Header(name = "Location", description = "The created payment"),
-        @Header(name = REPLAYED_HEADER, description = "Present and true on a replay")
-      },
+      description = "Completed",
+      headers = @Header(name = REPLAYED_HEADER, description = "true on a replay"),
       content = @Content(schema = @Schema(implementation = PaymentResponse.class)))
-  @ApiResponse(
-      responseCode = "400",
-      description = "Malformed request or invalid field",
-      content = @Content(schema = @Schema(implementation = ProblemDetail.class)))
-  @ApiResponse(
-      responseCode = "404",
-      description = "No such account for this user",
-      content = @Content(schema = @Schema(implementation = ProblemDetail.class)))
+  @ApiResponse(responseCode = "400", description = "Invalid request", content = @Content)
+  @ApiResponse(responseCode = "404", description = "No such account for this user")
   @ApiResponse(
       responseCode = "409",
-      description =
-          "Declined for insufficient funds. The attempt is recorded; `paymentId` and"
-              + " `Location` identify it.",
-      content = @Content(schema = @Schema(implementation = ProblemDetail.class)))
+      description = "Declined for insufficient funds; the attempt is recorded")
   @ApiResponse(
       responseCode = "422",
-      description =
-          "Currency differs from the account's, or the idempotency key was used for a"
-              + " different payment",
-      content = @Content(schema = @Schema(implementation = ProblemDetail.class)))
+      description = "Currency mismatch, or idempotency key used for a different payment")
   @ApiResponse(
       responseCode = "503",
-      description =
-          "Another payment on this account is in progress. Nothing was changed; retry after"
-              + " `Retry-After` seconds with the same key.",
-      headers = @Header(name = "Retry-After"),
-      content = @Content(schema = @Schema(implementation = ProblemDetail.class)))
+      description = "Account busy with another payment; retry with the same key",
+      headers = @Header(name = "Retry-After"))
   public ResponseEntity<?> submit(
       @PathVariable UUID userId,
       @PathVariable UUID accountId,
-      @Parameter(
-              in = ParameterIn.HEADER,
-              description =
-                  "Client-generated key identifying this payment, unique per account. A UUID is"
-                      + " recommended.",
-              required = true,
-              example = "3f1c2b9e-5d4a-4c8e-9f7a-1b2c3d4e5f60")
+      @Parameter(description = "Client-generated key, unique per payment. A UUID is recommended.")
           @RequestHeader("Idempotency-Key")
           @NotBlank
-          @Size(max = IdempotencyKey.MAX_LENGTH)
+          @Size(max = 255)
           String idempotencyKey,
       @Valid @RequestBody CreatePaymentRequest body) {
+    if (!isKnownCurrency(body.amount().currency())) {
+      return response(problem(HttpStatus.BAD_REQUEST, "validation_failed", "Unknown currency"));
+    }
 
     PaymentResult result =
-        paymentService.submit(
-            ApiMapper.toPaymentRequest(
-                new UserId(userId), new AccountId(accountId), idempotencyKey, body));
+        service.submit(
+            new PaymentRequest(
+                userId,
+                accountId,
+                idempotencyKey,
+                body.amount().value(),
+                body.amount().currency(),
+                body.beneficiary().name(),
+                body.beneficiary().iban(),
+                body.reference()));
+    metrics.counter("payment.attempts", "outcome", result.outcome().code()).increment();
 
-    return switch (result) {
-      case PaymentResult.Completed completed -> created(userId, completed.payment(), false);
-      case PaymentResult.Declined declined -> declined(userId, declined.attempt(), false);
-      case PaymentResult.Replayed replayed ->
-          // A replay returns what the first request returned, status code included, so a client
-          // retrying after a timeout sees exactly the response it missed.
-          replayed.original().isCompleted()
-              ? created(userId, replayed.original(), true)
-              : declined(userId, replayed.original(), true);
-      case PaymentResult.Rejected rejected -> rejected(rejected);
+    return switch (result.outcome()) {
+      case COMPLETED, INSUFFICIENT_FUNDS -> paymentResponse(userId, result.payment(), false);
+        // Same status and body as the original, so a client retrying after a timeout sees the
+        // response it missed.
+      case REPLAYED -> paymentResponse(userId, result.payment(), true);
+      case ACCOUNT_NOT_FOUND -> notFound(PaymentOutcome.ACCOUNT_NOT_FOUND.code(), "Account");
+      case CURRENCY_MISMATCH ->
+          response(
+              problem(
+                  HttpStatus.UNPROCESSABLE_ENTITY,
+                  result.outcome().code(),
+                  "Payment currency does not match the account currency"));
+      case IDEMPOTENCY_KEY_REUSED ->
+          response(
+              problem(
+                  HttpStatus.UNPROCESSABLE_ENTITY,
+                  result.outcome().code(),
+                  "Idempotency key already used for a different payment"));
     };
   }
 
-  @GetMapping("/{paymentId}")
-  @Operation(
-      summary = "Retrieve a payment",
-      description =
-          "Resolves the outcome of a submission, for instance after a client timeout. Returns"
-              + " declined attempts as well as completed ones.")
-  @ApiResponse(
-      responseCode = "200",
-      content = @Content(schema = @Schema(implementation = PaymentResponse.class)))
-  @ApiResponse(
-      responseCode = "404",
-      description = "No such payment on this user's account",
-      content = @Content(schema = @Schema(implementation = ProblemDetail.class)))
+  @GetMapping("/payments/{paymentId}")
+  @Operation(summary = "Retrieve a payment, completed or declined")
+  @ApiResponse(responseCode = "200")
+  @ApiResponse(responseCode = "404", description = "No such payment on this user's account")
   public ResponseEntity<?> get(
       @PathVariable UUID userId, @PathVariable UUID accountId, @PathVariable UUID paymentId) {
-    return accountService
-        .payment(new UserId(userId), new AccountId(accountId), new PaymentId(paymentId))
-        .<ResponseEntity<?>>map(payment -> ResponseEntity.ok(ApiMapper.toResponse(payment)))
-        .orElseGet(
-            () ->
-                problem(
-                    Problems.of(HttpStatus.NOT_FOUND, "payment_not_found", "Payment not found")));
+    return service
+        .payment(userId, accountId, paymentId)
+        .<ResponseEntity<?>>map(payment -> ResponseEntity.ok(toResponse(payment)))
+        .orElseGet(() -> notFound("payment_not_found", "Payment"));
   }
 
-  private ResponseEntity<?> created(UUID userId, Payment payment, boolean replayed) {
-    ResponseEntity.BodyBuilder response = ResponseEntity.created(locationOf(userId, payment));
+  @GetMapping("/balance")
+  @Operation(summary = "Get the current balance")
+  @ApiResponse(responseCode = "200")
+  @ApiResponse(responseCode = "404", description = "No such account for this user")
+  public ResponseEntity<?> balance(@PathVariable UUID userId, @PathVariable UUID accountId) {
+    return service
+        .account(userId, accountId)
+        .<ResponseEntity<?>>map(
+            account ->
+                ResponseEntity.ok(
+                    new BalanceResponse(
+                        account.id(),
+                        money(account.balance(), account.currency()),
+                        account.updatedAt())))
+        .orElseGet(() -> notFound(PaymentOutcome.ACCOUNT_NOT_FOUND.code(), "Account"));
+  }
+
+  /** 201 for a completed payment; 409 for a declined one, which still has an id and a location. */
+  private ResponseEntity<?> paymentResponse(UUID userId, Payment payment, boolean replayed) {
+    URI location =
+        ServletUriComponentsBuilder.fromCurrentContextPath()
+            .path("/api/v1/users/{userId}/accounts/{accountId}/payments/{paymentId}")
+            .buildAndExpand(userId, payment.accountId(), payment.id())
+            .toUri();
+    Object body;
+    if (payment.isCompleted()) {
+      body = toResponse(payment);
+    } else {
+      ProblemDetail problem =
+          problem(
+              HttpStatus.CONFLICT,
+              PaymentOutcome.INSUFFICIENT_FUNDS.code(),
+              "The account balance does not cover this payment");
+      problem.setProperty("paymentId", payment.id());
+      body = problem;
+    }
+    ResponseEntity.BodyBuilder response =
+        ResponseEntity.status(payment.isCompleted() ? HttpStatus.CREATED : HttpStatus.CONFLICT)
+            .location(location);
     if (replayed) {
       response.header(REPLAYED_HEADER, "true");
     }
-    return response.body(ApiMapper.toResponse(payment));
+    return response.body(body);
   }
 
-  /**
-   * A decline is an error to the caller but a recorded fact to the system, so the problem carries
-   * the payment's id and a {@code Location} for it: the attempt exists and can be retrieved.
-   */
-  private ResponseEntity<?> declined(UUID userId, Payment payment, boolean replayed) {
-    ProblemDetail problem =
-        Problems.of(
-            HttpStatus.CONFLICT,
-            PaymentOutcome.INSUFFICIENT_FUNDS,
-            "The account balance does not cover this payment");
-    problem.setProperty("paymentId", payment.id().value());
-
-    HttpHeaders headers = new HttpHeaders();
-    headers.setLocation(locationOf(userId, payment));
-    if (replayed) {
-      headers.set(REPLAYED_HEADER, "true");
-    }
-    return ResponseEntity.status(HttpStatus.CONFLICT).headers(headers).body(problem);
+  private static ResponseEntity<?> notFound(String code, String what) {
+    return response(problem(HttpStatus.NOT_FOUND, code, what + " not found"));
   }
 
-  private ResponseEntity<?> rejected(PaymentResult.Rejected rejected) {
-    return switch (rejected.outcome()) {
-        // Deliberately identical. The response must not reveal that an account exists but belongs
-        // to someone else; the distinction lives in the metric and the warn log.
-      case ACCOUNT_NOT_FOUND, ACCOUNT_NOT_OWNED ->
-          problem(
-              Problems.of(
-                  HttpStatus.NOT_FOUND, PaymentOutcome.ACCOUNT_NOT_FOUND, rejected.detail()));
-
-      case CURRENCY_MISMATCH, IDEMPOTENCY_KEY_REUSED ->
-          problem(
-              Problems.of(HttpStatus.UNPROCESSABLE_ENTITY, rejected.outcome(), rejected.detail()));
-
-      case LOCK_TIMEOUT ->
-          // Retry-After makes the transient nature machine-readable. One second comfortably
-          // exceeds the transaction time of the payment holding the lock.
-          ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-              .header(HttpHeaders.RETRY_AFTER, "1")
-              .body(
-                  Problems.of(
-                      HttpStatus.SERVICE_UNAVAILABLE, rejected.outcome(), rejected.detail()));
-
-      case VALIDATION_FAILED ->
-          problem(Problems.of(HttpStatus.BAD_REQUEST, rejected.outcome(), rejected.detail()));
-
-        // Not rejections: the sealed hierarchy routes these through other variants, and
-        // PaymentResult.Rejected refuses the two that produce journal entries.
-      case COMPLETED, INSUFFICIENT_FUNDS, IDEMPOTENT_REPLAY ->
-          throw new IllegalStateException("Not a rejection outcome: " + rejected.outcome());
-    };
-  }
-
-  private static ResponseEntity<?> problem(ProblemDetail problem) {
+  private static ResponseEntity<?> response(ProblemDetail problem) {
     return ResponseEntity.status(problem.getStatus()).body(problem);
   }
 
-  private static URI locationOf(UUID userId, Payment payment) {
-    return ServletUriComponentsBuilder.fromCurrentContextPath()
-        .path("/api/v1/users/{userId}/accounts/{accountId}/payments/{paymentId}")
-        .buildAndExpand(userId, payment.accountId().value(), payment.id().value())
-        .toUri();
+  private static PaymentResponse toResponse(Payment payment) {
+    return new PaymentResponse(
+        payment.id(),
+        payment.accountId(),
+        payment.status().name(),
+        money(payment.amount(), payment.currency()),
+        new BeneficiaryDto(payment.beneficiaryName(), payment.beneficiaryIban()),
+        payment.reference(),
+        payment.failureReason(),
+        payment.createdAt());
+  }
+
+  /** Renders at the currency's precision (250.5000 CHF as 250.50), never dropping a digit. */
+  private static MoneyDto money(BigDecimal amount, String currency) {
+    int digits = Currency.getInstance(currency).getDefaultFractionDigits();
+    int scale = Math.max(Math.max(digits, 0), amount.stripTrailingZeros().scale());
+    return new MoneyDto(amount.setScale(scale), currency);
+  }
+
+  private static boolean isKnownCurrency(String code) {
+    try {
+      Currency.getInstance(code);
+      return true;
+    } catch (IllegalArgumentException e) {
+      return false;
+    }
   }
 }
