@@ -13,15 +13,6 @@ import com.alpian.payment.domain.PaymentRequest;
 import com.alpian.payment.domain.PaymentResult;
 import com.alpian.payment.service.PaymentService;
 import io.micrometer.core.instrument.MeterRegistry;
-import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.Parameter;
-import io.swagger.v3.oas.annotations.headers.Header;
-import io.swagger.v3.oas.annotations.media.Content;
-import io.swagger.v3.oas.annotations.media.Schema;
-import io.swagger.v3.oas.annotations.responses.ApiResponse;
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Size;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.util.Currency;
@@ -40,13 +31,11 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 /**
  * Payments and balances. The {@code userId} path segment stands in for the authenticated user,
- * which would come from a validated token in production.
+ * which would come from a validated token in production. Documented in {@link PaymentApi}.
  */
 @RestController
 @RequestMapping("/api/v1/users/{userId}/accounts/{accountId}")
-public class PaymentController {
-
-  static final String REPLAYED_HEADER = "Idempotent-Replayed";
+public class PaymentController implements PaymentApi {
 
   private final PaymentService service;
   private final MeterRegistry metrics;
@@ -56,40 +45,13 @@ public class PaymentController {
     this.metrics = metrics;
   }
 
+  @Override
   @PostMapping("/payments")
-  @Operation(
-      summary = "Submit an outbound payment",
-      description =
-          """
-          Debits the account and records the payment, or declines it. Idempotent: resending \
-          the same `Idempotency-Key` returns the original response with \
-          `Idempotent-Replayed: true` and never debits twice.""")
-  @ApiResponse(
-      responseCode = "201",
-      description = "Completed",
-      headers = @Header(name = REPLAYED_HEADER, description = "true on a replay"),
-      content = @Content(schema = @Schema(implementation = PaymentResponse.class)))
-  @ApiResponse(responseCode = "400", description = "Invalid request", content = @Content)
-  @ApiResponse(responseCode = "404", description = "No such account for this user")
-  @ApiResponse(
-      responseCode = "409",
-      description = "Declined for insufficient funds; the attempt is recorded")
-  @ApiResponse(
-      responseCode = "422",
-      description = "Currency mismatch, or idempotency key used for a different payment")
-  @ApiResponse(
-      responseCode = "503",
-      description = "Account busy with another payment; retry with the same key",
-      headers = @Header(name = "Retry-After"))
   public ResponseEntity<?> submit(
       @PathVariable UUID userId,
       @PathVariable UUID accountId,
-      @Parameter(description = "Client-generated key, unique per payment. A UUID is recommended.")
-          @RequestHeader("Idempotency-Key")
-          @NotBlank
-          @Size(max = 255)
-          String idempotencyKey,
-      @Valid @RequestBody CreatePaymentRequest body) {
+      @RequestHeader("Idempotency-Key") String idempotencyKey,
+      @RequestBody CreatePaymentRequest body) {
     if (!isKnownCurrency(body.amount().currency())) {
       return response(problem(HttpStatus.BAD_REQUEST, "validation_failed", "Unknown currency"));
     }
@@ -128,10 +90,8 @@ public class PaymentController {
     };
   }
 
+  @Override
   @GetMapping("/payments/{paymentId}")
-  @Operation(summary = "Retrieve a payment, completed or declined")
-  @ApiResponse(responseCode = "200")
-  @ApiResponse(responseCode = "404", description = "No such payment on this user's account")
   public ResponseEntity<?> get(
       @PathVariable UUID userId, @PathVariable UUID accountId, @PathVariable UUID paymentId) {
     return service
@@ -140,10 +100,8 @@ public class PaymentController {
         .orElseGet(() -> notFound("payment_not_found", "Payment"));
   }
 
+  @Override
   @GetMapping("/balance")
-  @Operation(summary = "Get the current balance")
-  @ApiResponse(responseCode = "200")
-  @ApiResponse(responseCode = "404", description = "No such account for this user")
   public ResponseEntity<?> balance(@PathVariable UUID userId, @PathVariable UUID accountId) {
     return service
         .account(userId, accountId)
