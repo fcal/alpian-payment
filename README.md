@@ -40,10 +40,15 @@ curl -si -X POST $BASE/payments \
   -d '{"amount":{"value":"250.50","currency":"CHF"},
        "beneficiary":{"name":"Acme GmbH","iban":"CH93 0076 2011 6238 5295 7"},
        "reference":"Invoice 42"}'
+
+# paymentId from the response above, or the last segment of its Location header
+curl -s $BASE/payments/$PAYMENT_ID
 ```
 
 Resending with the same key returns the original response with `Idempotent-Replayed: true` and
-does not debit again. The notification service logs a `Notifying user ...` line for each payment.
+does not debit again. No notification is sent for a replayed request. 
+
+The notification service logs a `Notifying user ...` line for each payment.
 `scripts/tail-events.sh [-f] [-t TOPIC]` decodes the events on a topic (needs `kcat` and `protoc`).
 
 ## Testing
@@ -107,6 +112,39 @@ real, though: another user's account answers `404`, the same as a missing one.
   store.
 - **Bounded contention.** A lock wait is capped by `payment.lock-timeout` (3s) and answered with a
   retryable `503`, so a hot account cannot exhaust the connection pool.
+
+## Outbox and notifications
+
+```
+payment-service                          notification-service
+───────────────                          ────────────────────
+POST /payments
+  debit + payment + outbox row
+  (one DB transaction)
+         │
+OutboxRelay (polls every 500 ms)
+         │
+         ▼
+  [payment-events] ──▶ Kafka Streams dedup ("notified-payments" store)
+                                │  seen payment id → drop
+                                ▼
+                      [notification-events]
+                                │
+                       NotificationListener ──▶ NotificationSender
+                                │  retries exhausted
+                                ▼
+                      [notification-events-dlt]
+```
+
+- **Outbox.** The event is written as a row in the same transaction as the debit, and
+  `OutboxRelay` publishes pending rows to Kafka. Publishing is at least once: a crash between the
+  broker ack and marking the row published sends it again.
+- **Deduplication.** A Kafka Streams processor drops any payment id already in its state store
+  and emits one notification for each new one. The store write, the output and the input offset
+  commit together (`exactly_once_v2`).
+- **Delivery.** A plain `@KafkaListener` reads committed notifications and calls the sender,
+  retrying with backoff before dead-lettering. It runs outside Streams so that a retried Streams
+  transaction cannot send a notification twice. For the sake of the assignment, notification is just a log line.
 
 ## Observability
 
