@@ -74,7 +74,9 @@ The notification service logs a `Notifying user ...` line for each payment.
 
 ## REST API
 
-Swagger UI at **`/swagger-ui.html`**, OpenAPI at **`/v3/api-docs`**.
+Swagger UI at **[localhost:8080/swagger-ui.html](http://localhost:8080/swagger-ui.html)**, OpenAPI
+at **[localhost:8080/v3/api-docs](http://localhost:8080/v3/api-docs)**. Both are served by the
+payment service, so it must be running (see [Running](#running)).
 
 | Method | Path | Purpose |
 |---|---|---|
