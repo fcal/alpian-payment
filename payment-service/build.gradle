@@ -4,10 +4,8 @@ plugins {
     alias(libs.plugins.springDependencyManagement)
 }
 
-// Component tests live in their own source set. They are black-box: both services run as the
-// Docker images their Dockerfiles build, against real Postgres and Kafka containers, and the
-// tests reach them only over HTTP, Kafka and SQL. The source set therefore deliberately does not
-// see the main classes -- only the shared event contract in :proto.
+// Black-box component tests: both services run as Docker images against real Postgres and
+// Kafka. The source set sees only the event contract in :proto, not the main classes.
 sourceSets {
     component {}
 }
@@ -24,7 +22,6 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-jdbc'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
-    // Exposes the Actuator metrics in Prometheus text format at /actuator/prometheus.
     runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
     implementation 'org.springframework.kafka:spring-kafka'
     implementation libs.springdoc.webmvc
@@ -32,13 +29,11 @@ dependencies {
     runtimeOnly libs.flyway.postgresql
     runtimeOnly libs.postgresql
 
-    // Starts the compose.yaml stack on `bootRun` and wires the datasource / Kafka bootstrap
-    // servers from it, so running the service locally needs no manual container management.
+    // Starts compose.yaml on bootRun and wires the connections from it.
     developmentOnly 'org.springframework.boot:spring-boot-docker-compose'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation platform(libs.testcontainers.bom)
-    // @ServiceConnection: wires a Testcontainers database into a full application context.
     testImplementation 'org.springframework.boot:spring-boot-testcontainers'
     testImplementation libs.testcontainers.junit
     testImplementation libs.testcontainers.postgresql
@@ -58,8 +53,7 @@ tasks.register('componentTest', Test) {
     classpath = sourceSets.component.runtimeClasspath
     shouldRunAfter tasks.named('test')
 
-    // The images are built from these jars and Dockerfiles, so a change to any of them -- not
-    // only to the code -- reruns the tests.
+    // The images are built from these jars and Dockerfiles: any change reruns the tests.
     def serviceJars = [tasks.named('bootJar'), project(':notification-service').tasks.named('bootJar')]
     dependsOn serviceJars
     inputs.files(serviceJars)

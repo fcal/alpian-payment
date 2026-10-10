@@ -9,9 +9,8 @@ dependencies {
 
     implementation 'org.springframework.boot:spring-boot-starter'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
-    // Actuator's HTTP endpoints (health probes, /actuator/prometheus) need a web server.
+    // For the actuator endpoints.
     implementation 'org.springframework.boot:spring-boot-starter-web'
-    // Exposes the Actuator metrics in Prometheus text format at /actuator/prometheus.
     runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
     implementation 'org.springframework.kafka:spring-kafka'
     implementation libs.kafka.streams

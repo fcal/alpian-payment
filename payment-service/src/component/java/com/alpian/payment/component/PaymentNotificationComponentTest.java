@@ -36,15 +36,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * End to end, through every hop a payment takes: HTTP request, PostgreSQL journal, outbox, Kafka,
- * deduplication, delivery.
- *
- * <p>Delivery is observed in the notification service's own log, where its sender writes each
- * message: that line is the side effect a real provider call would replace, so it is the last hop
- * there is to assert on.
- *
- * <p>Each test creates its own user and account, so tests share the stack without depending on one
- * another or on the seeded demo data.
+ * End to end: HTTP, Postgres, outbox, Kafka, deduplication, delivery. Delivery is observed in the
+ * notification service's log, where its sender writes each message. Each test uses its own account.
  */
 class PaymentNotificationComponentTest {
 
@@ -59,7 +52,6 @@ class PaymentNotificationComponentTest {
   void givenAccount() {
     user = UUID.randomUUID();
     account = UUID.randomUUID();
-    sql("INSERT INTO app_user (id, name) VALUES (?, 'Component Test')", user);
     sql(
         "INSERT INTO account (id, user_id, balance, currency) VALUES (?, ?, 1000.00, 'CHF')",
         account,
@@ -75,12 +67,10 @@ class PaymentNotificationComponentTest {
     assertThat(created.body().get("status").asText()).isEqualTo("COMPLETED");
     String paymentId = created.paymentId();
 
-    // Journal and balance, committed together.
     assertThat(api.balance(user, account).body().at("/balance/value").asText()).isEqualTo("880.00");
     assertThat(queryString("SELECT status FROM payment WHERE id = ?", UUID.fromString(paymentId)))
         .contains("COMPLETED");
 
-    // Outbox to Kafka: published, keyed by account, with the payment id as a header.
     ConsumerRecord<String, byte[]> published = awaitRecord("payment-events", paymentId);
     PaymentEvent event = PaymentEvent.parseFrom(published.value());
     assertThat(published.key()).isEqualTo(account.toString());
@@ -91,11 +81,10 @@ class PaymentNotificationComponentTest {
         .until(
             () ->
                 queryString(
-                        "SELECT published_at::text FROM outbox WHERE aggregate_id = ?",
+                        "SELECT published_at::text FROM outbox WHERE payment_id = ?",
                         UUID.fromString(paymentId))
                     .isPresent());
 
-    // Deduplicated notification, then delivery.
     NotificationEvent notification =
         NotificationEvent.parseFrom(awaitRecord("notification-events", paymentId).value());
     assertThat(notification.getUserId()).isEqualTo(user.toString());
@@ -115,8 +104,7 @@ class PaymentNotificationComponentTest {
     assertThat(retry.paymentId()).isEqualTo(first.paymentId());
     assertThat(api.balance(user, account).body().at("/balance/value").asText()).isEqualTo("925.00");
 
-    // A later payment on the same account is delivered after anything the first could have
-    // caused, so once it arrives, a second notification for the first would have too.
+    // A later payment on the same account is delivered after any duplicate of the first would be.
     String marker = api.pay(user, account, "marker", "1.00", "CHF").paymentId();
     awaitDelivery(marker);
     assertThat(deliveries(first.paymentId())).hasSize(1);
@@ -177,25 +165,24 @@ class PaymentNotificationComponentTest {
       created = api.pay(user, account, "during-outage", "42.00", "CHF");
       Duration took = Duration.ofNanos(System.nanoTime() - start);
 
-      // The payment path never waits on Kafka.
       assertThat(created.status()).isEqualTo(201);
       assertThat(took).isLessThan(Duration.ofSeconds(2));
       assertThat(new BigDecimal(api.balance(user, account).body().at("/balance/value").asText()))
           .isEqualByComparingTo("958.00");
 
-      // The relay is trying, failing, and keeping the event: retried, not parked.
+      // The relay retries and keeps the event: not published, not parked.
       String paymentId = created.paymentId();
       await()
           .atMost(TIMEOUT)
           .until(
               () ->
                   queryLong(
-                          "SELECT attempts FROM outbox WHERE aggregate_id = ?",
+                          "SELECT attempts FROM outbox WHERE payment_id = ?",
                           UUID.fromString(paymentId))
                       > 0);
       assertThat(
               queryString(
-                  "SELECT coalesce(published_at, parked_at)::text FROM outbox WHERE aggregate_id = ?",
+                  "SELECT coalesce(published_at, parked_at)::text FROM outbox WHERE payment_id = ?",
                   UUID.fromString(paymentId)))
           .isEmpty();
     } finally {

@@ -1,41 +1,84 @@
 package com.alpian.payment.repository;
 
-import com.alpian.payment.domain.AccountId;
-import com.alpian.payment.domain.IdempotencyKey;
 import com.alpian.payment.domain.Payment;
-import com.alpian.payment.domain.PaymentId;
-import java.util.List;
+import com.alpian.payment.domain.PaymentStatus;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.util.Optional;
+import java.util.UUID;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Repository;
 
-/**
- * The payment journal.
- *
- * <p>Append-only: there is deliberately no update or delete. A payment records something that
- * happened, and history is not editable. A correction is a new entry, not an amendment.
- */
-public interface PaymentRepository {
+/** The append-only payment journal. */
+@Repository
+public class PaymentRepository {
 
-  /**
-   * Appends a payment to the journal.
-   *
-   * @throws DuplicateIdempotencyKeyException if the account has already used that key. This is the
-   *     authoritative double-spend guard: unlike the service's prior replay check, it cannot be
-   *     raced.
-   */
-  Payment append(Payment payment);
+  private static final String SELECT =
+      """
+      SELECT id, account_id, idempotency_key, amount, currency, beneficiary_name,
+             beneficiary_iban, reference, status, failure_reason, created_at
+        FROM payment
+      """;
 
-  /**
-   * Finds a payment made from a given account.
-   *
-   * <p>Deliberately no unscoped {@code findById}. Every read of a payment states which account it
-   * belongs to, so the scoping is part of the query rather than a filter a caller might forget —
-   * and another account's payment is never loaded at all, rather than loaded and discarded.
-   */
-  Optional<Payment> findByIdAndAccountId(PaymentId id, AccountId accountId);
+  private final JdbcClient jdbc;
 
-  /** Finds a previously recorded attempt under the same key, for idempotent replay. */
-  Optional<Payment> findByAccountIdAndIdempotencyKey(AccountId accountId, IdempotencyKey key);
+  public PaymentRepository(JdbcClient jdbc) {
+    this.jdbc = jdbc;
+  }
 
-  /** Payment history for an account, most recent first. */
-  List<Payment> findByAccountId(AccountId accountId);
+  public void insert(Payment payment) {
+    jdbc.sql(
+            """
+            INSERT INTO payment (id, account_id, idempotency_key, amount, currency,
+                                 beneficiary_name, beneficiary_iban, reference,
+                                 status, failure_reason, created_at)
+            VALUES (:id, :accountId, :key, :amount, :currency, :name, :iban, :reference,
+                    :status, :failureReason, :createdAt)
+            """)
+        .param("id", payment.id())
+        .param("accountId", payment.accountId())
+        .param("key", payment.idempotencyKey())
+        .param("amount", payment.amount())
+        .param("currency", payment.currency())
+        .param("name", payment.beneficiaryName())
+        .param("iban", payment.beneficiaryIban())
+        .param("reference", payment.reference())
+        .param("status", payment.status().name())
+        .param("failureReason", payment.failureReason())
+        .param("createdAt", Timestamp.from(payment.createdAt()))
+        .update();
+  }
+
+  /** Scoped by account, so a payment is never read through an account it was not made from. */
+  public Optional<Payment> find(UUID accountId, UUID paymentId) {
+    return jdbc.sql(SELECT + " WHERE account_id = :accountId AND id = :id")
+        .param("accountId", accountId)
+        .param("id", paymentId)
+        .query(PaymentRepository::map)
+        .optional();
+  }
+
+  public Optional<Payment> findByIdempotencyKey(UUID accountId, String key) {
+    return jdbc.sql(SELECT + " WHERE account_id = :accountId AND idempotency_key = :key")
+        .param("accountId", accountId)
+        .param("key", key)
+        .query(PaymentRepository::map)
+        .optional();
+  }
+
+  private static Payment map(ResultSet rs, int row) throws SQLException {
+    return new Payment(
+        rs.getObject("id", UUID.class),
+        rs.getObject("account_id", UUID.class),
+        rs.getString("idempotency_key"),
+        rs.getBigDecimal("amount"),
+        rs.getString("currency"),
+        rs.getString("beneficiary_name"),
+        rs.getString("beneficiary_iban"),
+        rs.getString("reference"),
+        PaymentStatus.valueOf(rs.getString("status")),
+        rs.getString("failure_reason"),
+        rs.getTimestamp("created_at").toInstant());
+  }
 }
