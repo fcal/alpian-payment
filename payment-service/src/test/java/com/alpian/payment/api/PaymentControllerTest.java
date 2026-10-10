@@ -34,8 +34,10 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Import;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.springframework.transaction.CannotCreateTransactionException;
 
 /** The HTTP contract, with the service mocked. */
 @WebMvcTest(PaymentController.class)
@@ -172,6 +174,23 @@ class PaymentControllerTest {
         .andExpect(status().isServiceUnavailable())
         .andExpect(header().string("Retry-After", "1"))
         .andExpect(jsonPath("$.code").value("lock_timeout"));
+  }
+
+  @Test
+  @DisplayName("an unreachable database is a retryable 503, not a 500")
+  void databaseUnavailable() throws Exception {
+    when(service.submit(any()))
+        .thenThrow(new CannotCreateTransactionException("Could not open JDBC Connection"));
+    mvc.perform(submit(BODY))
+        .andExpect(status().isServiceUnavailable())
+        .andExpect(header().string("Retry-After", "5"))
+        .andExpect(jsonPath("$.code").value("service_unavailable"));
+
+    when(service.payment(any(), any(), any()))
+        .thenThrow(new CannotGetJdbcConnectionException("Connection is not available"));
+    mvc.perform(get(BASE + "/payments/" + UUID.randomUUID()))
+        .andExpect(status().isServiceUnavailable())
+        .andExpect(jsonPath("$.code").value("service_unavailable"));
   }
 
   @Test

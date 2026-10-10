@@ -90,6 +90,7 @@ Swagger UI at **`/swagger-ui.html`**, OpenAPI at **`/v3/api-docs`**.
 | `409` | Insufficient funds; the attempt is recorded and identified by `paymentId` / `Location` | `insufficient_funds` |
 | `422` | Currency differs from the account's, or the key was used for a different payment | `currency_mismatch`, `idempotency_key_reused` |
 | `503` | Another payment on the account is in progress; retry after `Retry-After` with the same key | `lock_timeout` |
+| `503` | Database temporarily unreachable; retry after `Retry-After` with the same key | `service_unavailable` |
 
 Errors are RFC 9457 problem details; clients branch on `code`. Amounts are decimal strings. A
 replay returns the original status, including `409` for a declined payment.
@@ -153,6 +154,7 @@ Prometheus metrics at `/actuator/prometheus`, health probes at `/actuator/health
 | Metric | Meaning |
 |---|---|
 | `payment_attempts_total{outcome}` | Payment requests by outcome |
+| `payment_database_unavailable_total` | Requests answered `503` because the database was unreachable |
 | `payment_outbox_pending` | Events awaiting publication; growth means a stalled relay |
 | `notification_events_total{outcome}` | `notified`, `duplicate`, `skipped` (undecodable or invalid) |
 | `notification_deliveries_dead_lettered_total` | Notifications that failed every retry |

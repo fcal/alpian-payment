@@ -1,6 +1,10 @@
 spring:
   application:
     name: payment-service
+  # On SIGTERM, stop taking requests and let in-flight payments finish (Boot 3.3 defaults to
+  # immediate). Kept below Kubernetes' default 30s termination grace period.
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
 
   # Locally, spring-boot-docker-compose wires these from compose.yaml.
   datasource:
@@ -58,3 +62,6 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+
+server:
+  shutdown: graceful

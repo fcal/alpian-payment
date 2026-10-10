@@ -133,11 +133,14 @@ RFC 9457 problem details with a stable `code` property:
 | Insufficient funds (recorded; `paymentId` + `Location` returned) | 409 | `insufficient_funds` |
 | Currency mismatch / key reused for a different payment | 422 | `currency_mismatch` / `idempotency_key_reused` |
 | Account lock not acquired in time | 503 + `Retry-After` | `lock_timeout` |
+| Database unreachable or pool exhausted (e.g. primary failover) | 503 + `Retry-After` | `service_unavailable` |
 | Anything unexpected (details logged, not returned) | 500 | `internal_error` |
 
 Postgres reports a lock timeout as SQLSTATE `55P03`, which Spring leaves uncategorised. The
 repository translates it into `CannotAcquireLockException`, so that contention becomes a
-retryable `503` instead of an opaque `500`.
+retryable `503` instead of an opaque `500`. Connection failures are mapped the same way: nothing
+committed, so retrying with the same key is safe. Both services shut down gracefully, so a
+rolling deploy lets in-flight requests finish instead of resetting them.
 
 ## 8. High availability in production
 

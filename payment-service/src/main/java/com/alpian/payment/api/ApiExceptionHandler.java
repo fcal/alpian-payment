@@ -5,11 +5,14 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -46,6 +49,29 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
                 HttpStatus.SERVICE_UNAVAILABLE,
                 "lock_timeout",
                 "Another payment on this account is in progress"));
+  }
+
+  /**
+   * The database is unreachable or the pool is exhausted, for instance during a primary failover.
+   * The transaction did not commit, so the client can retry with the same idempotency key. More
+   * specific handlers (the lock timeout above) take precedence.
+   */
+  @ExceptionHandler({
+    TransientDataAccessException.class,
+    DataAccessResourceFailureException.class,
+    CannotCreateTransactionException.class
+  })
+  ResponseEntity<ProblemDetail> databaseUnavailable(Exception ex, WebRequest request) {
+    log.warn(
+        "Database unavailable processing {}: {}", request.getDescription(false), ex.toString());
+    metrics.counter("payment.database.unavailable").increment();
+    return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+        .header(HttpHeaders.RETRY_AFTER, "5")
+        .body(
+            problem(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "The service is temporarily unavailable"));
   }
 
   /** Internal details go to the log, not to the client. */
