@@ -7,12 +7,15 @@ import java.util.List;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.lang.Nullable;
+import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -89,6 +92,29 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
   ResponseEntity<Object> handleInvalidRequest(InvalidRequestException ex, WebRequest request) {
     return handleExceptionInternal(
         ex, validationProblem(ex.getMessage()), new HttpHeaders(), HttpStatus.BAD_REQUEST, request);
+  }
+
+  /**
+   * The database is unreachable or the pool is exhausted, for instance during a primary failover.
+   * The transaction did not commit, so the client can retry with the same idempotency key. A lock
+   * timeout never reaches here: the service turns it into {@link PaymentOutcome#LOCK_TIMEOUT}.
+   */
+  @ExceptionHandler({
+    TransientDataAccessException.class,
+    DataAccessResourceFailureException.class,
+    CannotCreateTransactionException.class
+  })
+  ResponseEntity<Object> handleDatabaseUnavailable(Exception ex, WebRequest request) {
+    log.warn("Database unavailable processing {}: {}", describe(request), ex.toString());
+    metrics.recordDatabaseUnavailable();
+    HttpHeaders headers = new HttpHeaders();
+    headers.set(HttpHeaders.RETRY_AFTER, "5");
+    ProblemDetail problem =
+        Problems.of(
+            HttpStatus.SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "The service is temporarily unavailable");
+    return handleExceptionInternal(ex, problem, headers, HttpStatus.SERVICE_UNAVAILABLE, request);
   }
 
   /**

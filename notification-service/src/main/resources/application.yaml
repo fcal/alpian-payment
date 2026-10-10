@@ -1,6 +1,9 @@
 spring:
   application:
     name: notification-service
+  # On SIGTERM, let the listener finish its current delivery and Streams commit before exiting.
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
@@ -81,3 +84,4 @@ management:
 
 server:
   port: 8081
+  shutdown: graceful

@@ -38,6 +38,7 @@ public class PaymentMetrics {
   private static final String AMOUNT = "payment.amount";
   private static final String EXECUTION = "payment.execution";
   private static final String LOCK_WAIT = "payment.lock.wait";
+  private static final String DATABASE_UNAVAILABLE = "payment.database.unavailable";
   private static final String OUTBOX_PUBLISHED = "payment.outbox.published";
   private static final String OUTBOX_FAILURES = "payment.outbox.publish.failures";
   private static final String OUTBOX_PARKED = "payment.outbox.parked";
@@ -53,6 +54,7 @@ public class PaymentMetrics {
 
   private final Timer execution;
   private final Timer lockWait;
+  private final Counter databaseUnavailable;
   private final Counter outboxPublished;
   private final Counter outboxFailures;
   private final Counter outboxParked;
@@ -108,6 +110,11 @@ public class PaymentMetrics {
     this.lockWait =
         Timer.builder(LOCK_WAIT)
             .description("Time spent waiting to acquire the per-account row lock")
+            .register(registry);
+
+    this.databaseUnavailable =
+        Counter.builder(DATABASE_UNAVAILABLE)
+            .description("Requests answered 503 because the database was unreachable")
             .register(registry);
 
     this.outboxPublished =
@@ -182,6 +189,11 @@ public class PaymentMetrics {
   /** Records how long a payment waited for the per-account row lock. */
   public void recordLockWait(Duration waited) {
     lockWait.record(waited);
+  }
+
+  /** Records a request answered 503 because the database was unreachable or the pool exhausted. */
+  public void recordDatabaseUnavailable() {
+    databaseUnavailable.increment();
   }
 
   /** Records a batch of outbox rows published successfully. */

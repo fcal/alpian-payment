@@ -70,7 +70,8 @@ interface PaymentApi {
   @ApiResponse(
       responseCode = "503",
       description =
-          "Another payment on this account is in progress. Nothing was changed; retry after"
+          "Another payment on this account is in progress (`lock_timeout`), or the database is"
+              + " temporarily unavailable (`service_unavailable`). Nothing was changed; retry after"
               + " `Retry-After` seconds with the same key.",
       headers = @Header(name = "Retry-After"),
       content = @Content(schema = @Schema(implementation = ProblemDetail.class)))

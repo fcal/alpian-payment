@@ -294,11 +294,17 @@ Protobuf is a good choice (compact, evolvable, consistent with the reference rep
   | Idempotency key reused with a different payload | `422` (see Stage 3 findings) |
   | Currency mismatch | `422` |
   | Lock timeout / contention | `503` + `Retry-After` |
+  | Database unreachable, pool exhausted (e.g. primary failover) | `503` + `Retry-After` |
 - **Account ownership check.** `userId` in the path is only meaningful if the service verifies
   the account belongs to that user. Without it the path is a trivial IDOR. This is business
   logic, not auth — it should exist and be tested even with auth out of scope.
 - **`lock_timeout` / `statement_timeout`** so a stuck lock doesn't exhaust the connection pool.
   Map the timeout to `503`.
+  *Implemented, and extended: connection failures, an exhausted pool and a transaction that
+  cannot be opened also answer `503 service_unavailable` with `Retry-After` rather than falling
+  through to `500`. Nothing committed, so retrying with the same key is safe. Both services shut
+  down gracefully (`server.shutdown=graceful`, 20s per phase, under Kubernetes' default 30s grace
+  period), so a rolling deploy lets in-flight requests finish instead of resetting them.*
 - **Consumer-side DLT:** Spring Kafka `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`;
   in Streams, a `DeserializationExceptionHandler` (`LogAndContinue`) and a production exception
   handler. *Revised in Stage 5: `LogAndContinue` drops the record, so decoding moved into the
@@ -661,10 +667,10 @@ Testcontainers' HTTP wait strategy with a response-body predicate never matched,
 endpoint returned the expected body when probed by hand. Rather than depend on it, the stack
 polls the liveness endpoint itself and fails with the last response it saw.
 
-### Stage 7 — Polish
-README design-decision write-up (locking strategy, ORM vs SQL, outbox vs CDC, key design, why
-Streams, what HA requires, explicit security exclusions), GitHub Actions CI, Actuator, final
-review pass.
+### Stage 7 — Polish (not implemented)
+Planned: GitHub Actions CI and a final review pass. Not carried out for this assignment. The
+design write-up it also covered lives in the README (design choices, limitations, and what
+production readiness would require) and in this document.
 
 ---
 
